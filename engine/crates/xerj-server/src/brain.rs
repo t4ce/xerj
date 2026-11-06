@@ -748,8 +748,9 @@ fn wait_ready(probe: &Es, booted: &BootedServer) -> Result<()> {
         }
         // A dead child never becomes ready; surface its log immediately.
         // (`try_wait` is unavailable here — the child is detached — so probe
-        // liveness via signal 0 on unix, and rely on the deadline elsewhere.)
-        #[cfg(unix)]
+        // liveness via signal 0 on host Unix.) TRUEOS has no cross-Hull PID
+        // lookup; readiness remains bounded by BOOT_TIMEOUT on that target.
+        #[cfg(all(unix, not(target_os = "trueos")))]
         {
             let alive = unsafe { libc::kill(booted.pid as libc::pid_t, 0) } == 0;
             if !alive {

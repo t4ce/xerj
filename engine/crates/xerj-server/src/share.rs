@@ -969,36 +969,49 @@ fn create_share(es: &Es, common: &Common, create: &CreateCfg) -> Result<i32> {
     let mut tunnel: Option<Tunnel> = None;
     let mut tunnel_note: Option<String> = None;
     // Listening before the tunnel exists — see `Interrupts`.
+    #[cfg(not(target_os = "trueos"))]
     let interrupts = create.tunnel.then(Interrupts::listen);
+    #[cfg(target_os = "trueos")]
+    let interrupts: Option<Interrupts> = None;
     if create.tunnel {
-        let (_, port) = local_http_origin(&common.url).map_err(|e| anyhow!(e))?;
-        match find_cloudflared() {
-            None => {
-                tunnel_note = Some(format!(
-                    "--tunnel needs `cloudflared`, which is not installed (looked on PATH and \
+        #[cfg(target_os = "trueos")]
+        {
+            tunnel_note = Some(format!(
+                "the tunnel did not come up: {}\n  the link above only works on this machine.",
+                native_tunnel_error()
+            ));
+        }
+        #[cfg(not(target_os = "trueos"))]
+        {
+            let (_, port) = local_http_origin(&common.url).map_err(|e| anyhow!(e))?;
+            match find_cloudflared() {
+                None => {
+                    tunnel_note = Some(format!(
+                        "--tunnel needs `cloudflared`, which is not installed (looked on PATH and \
                      in ~/.local/bin).\n{}\n  then run this command again. Until then the \
                      link above only works on this machine.",
-                    cloudflared_install_help()
-                ));
-            }
-            Some(bin) => {
-                eprintln!("opening a tunnel with {} …", bin.display());
-                let opened = Tunnel::open(
-                    &bin,
-                    port,
-                    interrupts.as_ref().expect("listening when --tunnel is set"),
-                );
-                match opened {
-                    Ok(t) => tunnel = Some(t),
-                    Err(OpenError::Interrupted(why)) => {
-                        eprintln!("{why} before the tunnel was up — nothing was shared.");
-                        return Ok(130);
-                    }
-                    Err(OpenError::Failed(e)) => {
-                        tunnel_note = Some(format!(
+                        cloudflared_install_help()
+                    ));
+                }
+                Some(bin) => {
+                    eprintln!("opening a tunnel with {} …", bin.display());
+                    let opened = Tunnel::open(
+                        &bin,
+                        port,
+                        interrupts.as_ref().expect("listening when --tunnel is set"),
+                    );
+                    match opened {
+                        Ok(t) => tunnel = Some(t),
+                        Err(OpenError::Interrupted(why)) => {
+                            eprintln!("{why} before the tunnel was up — nothing was shared.");
+                            return Ok(130);
+                        }
+                        Err(OpenError::Failed(e)) => {
+                            tunnel_note = Some(format!(
                             "the tunnel did not come up: {e:#}\n  the link above only works on \
                              this machine."
                         ))
+                        }
                     }
                 }
             }
@@ -1395,10 +1408,19 @@ const TICK: Duration = Duration::from_millis(200);
 /// What [`Tunnel::wait`] returns when the tunnel went away by itself.
 const CLOUDFLARED_STOPPED: &str = "cloudflared stopped";
 
+#[cfg(any(test, target_os = "trueos"))]
+fn native_tunnel_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "TRUEOS cannot launch/control the external cloudflared executable; use a separately managed tunnel with --public-url",
+    )
+}
+
 impl Tunnel {
     /// Spawn `cloudflared tunnel --url http://127.0.0.1:<port>` and wait for
     /// its hostname. `127.0.0.1`, not `localhost`: the node binds IPv4
     /// loopback by default and `localhost` may resolve to `::1` first.
+    #[cfg(not(target_os = "trueos"))]
     fn open(bin: &Path, port: u16, interrupts: &Interrupts) -> Result<Self, OpenError> {
         let failed = |msg: String| OpenError::Failed(anyhow!(msg));
         let mut command = Command::new(bin);
@@ -1539,6 +1561,16 @@ impl Tunnel {
         Ok(tunnel)
     }
 
+    #[cfg(target_os = "trueos")]
+    fn open(_bin: &Path, _port: u16, _interrupts: &Interrupts) -> Result<Self, OpenError> {
+        Self::open_native(_bin, _port, _interrupts)
+    }
+
+    #[cfg(any(test, target_os = "trueos"))]
+    fn open_native(_bin: &Path, _port: u16, _interrupts: &Interrupts) -> Result<Self, OpenError> {
+        Err(OpenError::Failed(native_tunnel_error().into()))
+    }
+
     /// Block until a signal arrives or `cloudflared` goes away. Returns why.
     fn wait(&self, interrupts: &Interrupts) -> &'static str {
         loop {
@@ -1559,21 +1591,26 @@ impl Drop for Tunnel {
     /// The tunnel never outlives this command: terminate, give it a moment to
     /// deregister from the edge, then kill.
     fn drop(&mut self) {
-        #[cfg(unix)]
+        // No Tunnel can be constructed on TRUEOS: `open` returns Unsupported
+        // before launching anything. Host cleanup retains its process contract.
+        #[cfg(not(target_os = "trueos"))]
         {
-            // SAFETY: plain `kill(2)` on a pid we spawned and still own.
-            unsafe {
-                libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
-            }
-            for _ in 0..30 {
-                if matches!(self.child.try_wait(), Ok(Some(_))) {
-                    return;
+            #[cfg(unix)]
+            {
+                // SAFETY: plain `kill(2)` on a pid we spawned and still own.
+                unsafe {
+                    libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                for _ in 0..30 {
+                    if matches!(self.child.try_wait(), Ok(Some(_))) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -1628,6 +1665,23 @@ fn remember_tunnel_line(log: &TunnelLog, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_tunnel_launch_refuses_before_using_an_external_executable() {
+        let (_tx, rx) = mpsc::channel();
+        let error =
+            match Tunnel::open_native(Path::new("/no-such-cloudflared"), 9200, &Interrupts(rx)) {
+                Err(OpenError::Failed(error)) => error,
+                Err(OpenError::Interrupted(_)) => {
+                    panic!("unsupported launch cannot be interrupted")
+                }
+                Ok(_) => panic!("native tunnel launch cannot succeed"),
+            };
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::Unsupported,
+        );
+    }
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

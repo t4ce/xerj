@@ -16,6 +16,8 @@ pub mod jsonl;
 pub mod logs;
 pub mod man;
 pub mod mbox;
+#[cfg(any(target_os = "trueos", test))]
+pub mod native_worker;
 pub(crate) mod opc;
 pub mod pdf;
 pub mod pptx;

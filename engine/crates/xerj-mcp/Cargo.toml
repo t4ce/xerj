@@ -6,6 +6,13 @@ license.workspace = true
 authors.workspace = true
 description = "Model Context Protocol (MCP) stdio server exposing the canonical XERJ agent operations (search, memory, second-brain graph, field map, reference-code) as thin proxies to an ES-compatible XERJ endpoint, plus the Corpus Hub ask/def/find tools"
 
+[package.metadata.trueos-blueprint]
+# Each MCP connection owns its stdio stream and per-process configuration.
+replicatable = true
+entry-abi = "argv-v1"
+fs-scope = "trueosfs"
+rewrite-std-imports = false
+
 # Library first: the `xerj mcp` subcommand on the main binary calls
 # `xerj_mcp::run`, so a user with the installed `xerj` binary already has the
 # MCP server. The standalone binary below is a thin wrapper over the same entry

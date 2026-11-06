@@ -57,10 +57,10 @@ use std::sync::Arc;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher as Crc32Hasher;
-use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 use uuid::Uuid;
+use xerj_common::file_image::FileImage as Mmap;
 
 use crate::{Result, SeqNo, StorageError};
 
@@ -549,8 +549,7 @@ pub struct SegmentReader {
 impl SegmentReader {
     /// Open the `.seg` file at `path` and validate the header + footer.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let file = File::open(path.as_ref())?;
-        let mmap = unsafe { Mmap::map(&file) }?;
+        let mmap = unsafe { xerj_common::file_image::open(path.as_ref()) }?;
         let mmap = Arc::new(mmap);
         let reader = Self::from_mmap(mmap)?;
         // #819: `from_mmap`'s open-time whole-file CRC pass reads every

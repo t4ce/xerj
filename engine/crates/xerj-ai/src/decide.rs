@@ -164,6 +164,15 @@ impl DecideModel {
             .map_err(|e| anyhow!("configure decide tokenizer truncation: {e}"))?;
 
         let device = Device::Cpu;
+        #[cfg(target_os = "trueos")]
+        let vb = VarBuilder::from_buffered_safetensors(
+            std::fs::read(&weights_path)
+                .with_context(|| format!("read decide weights {}", weights_path.display()))?,
+            DType::F32,
+            &device,
+        )
+        .with_context(|| format!("load decide weights {}", weights_path.display()))?;
+        #[cfg(not(target_os = "trueos"))]
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(
                 std::slice::from_ref(&weights_path),

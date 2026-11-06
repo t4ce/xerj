@@ -450,7 +450,7 @@ fn path_names_this_file(file: &File, path: &Path) -> bool {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn pid_liveness(pid: u32) -> Liveness {
     // `kill` takes a `pid_t`. A value that does not fit is not a Unix PID;
     // refusing to signal it also avoids casting it to a negative pid.
@@ -528,7 +528,9 @@ fn pid_liveness(pid: u32) -> Liveness {
     }
 }
 
-#[cfg(not(any(unix, windows)))]
+// Without a cross-Hull lifetime lookup, a TRUEOS PID cannot prove that an
+// owner is dead. Keep recovery conservative: Unknown never authorizes a steal.
+#[cfg(any(target_os = "trueos", not(any(unix, windows))))]
 fn pid_liveness(_pid: u32) -> Liveness {
     Liveness::Unknown
 }
@@ -672,6 +674,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "trueos"))]
     fn this_process_is_alive_and_a_reaped_child_is_dead() {
         assert_eq!(pid_liveness(std::process::id()), Liveness::Alive);
         assert_eq!(pid_liveness(0), Liveness::Unknown);

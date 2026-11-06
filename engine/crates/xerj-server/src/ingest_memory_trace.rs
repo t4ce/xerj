@@ -297,7 +297,7 @@ fn record_sink_error(dropped: &AtomicU64, path: &str, error: &std::io::Error) {
     );
 }
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(not(target_env = "msvc"), not(target_os = "trueos")))]
 fn allocator_snapshot() -> AllocatorSnapshot {
     use tikv_jemalloc_ctl::{epoch, stats};
     if epoch::advance().is_err() {
@@ -318,7 +318,7 @@ fn allocator_snapshot() -> AllocatorSnapshot {
     }
 }
 
-#[cfg(target_env = "msvc")]
+#[cfg(any(target_env = "msvc", target_os = "trueos"))]
 fn allocator_snapshot() -> AllocatorSnapshot {
     AllocatorSnapshot::default()
 }

@@ -13,7 +13,9 @@
 //! one directory, [`stage_file`] plus one [`publish_staged`]. Unix makes the rename
 //! durable with parent-directory fsync; Windows uses a same-directory Win32
 //! write-through replacement because it has no equivalent directory-fsync
-//! contract.
+//! contract. TRUEOS waits for its file-write and rename operations to complete,
+//! then validates the parent directory instead of issuing unsupported directory
+//! fsync. The TRUEOS path does not establish a hardware power-loss barrier.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -25,10 +27,33 @@ use std::os::windows::ffi::OsStrExt as _;
 /// power loss. No-op errors are surfaced to the caller; on filesystems
 /// where directories cannot be fsynced (rare), callers may choose to
 /// ignore the error.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "trueos")))]
 pub fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     let d = std::fs::File::open(dir)?;
     sync_file_full(&d)
+}
+
+/// Validate the publication directory after completed TRUEOSFS operations.
+///
+/// TRUEOS regular-file sync waits for writeback, and rename waits for the
+/// namespace operation. Directory descriptors cannot be fsynced. This step
+/// preserves missing-path and wrong-type errors without claiming a POSIX
+/// directory-fsync guarantee or an additional hardware persistence barrier.
+#[cfg(target_os = "trueos")]
+pub fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    validate_trueos_directory(dir)
+}
+
+#[cfg(any(target_os = "trueos", test))]
+fn validate_trueos_directory(dir: &Path) -> std::io::Result<()> {
+    if std::fs::metadata(dir)?.is_dir() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "publication parent is not a directory",
+        ))
+    }
 }
 
 /// How many full flushes ([`sync_file_full`]) this process has issued.
@@ -593,6 +618,27 @@ mod tests {
     fn fsync_dir_works() {
         let dir = tempfile::tempdir().unwrap();
         fsync_dir(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn trueos_directory_validation_accepts_an_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        validate_trueos_directory(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn trueos_directory_validation_rejects_missing_and_regular_file_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parent");
+        assert_eq!(
+            validate_trueos_directory(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        std::fs::write(&path, b"file").unwrap();
+        assert_eq!(
+            validate_trueos_directory(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotADirectory
+        );
     }
 
     #[cfg(windows)]

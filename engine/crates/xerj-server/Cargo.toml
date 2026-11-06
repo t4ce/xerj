@@ -6,6 +6,14 @@ license.workspace = true
 authors.workspace = true
 description = "xerj — the unified search engine for AI: full-text, vectors, hybrid retrieval, agent memory, and log analytics in one binary; zero-config folder onboarding via `xerj autoindex`; Elasticsearch wire-compatible"
 
+[package.metadata.trueos-blueprint]
+# The node, CLI workers and MCP connections need independent process state.
+replicatable = true
+entry-abi = "argv-v1"
+# Index sources and persistent data keep their shared TRUEOSFS paths.
+fs-scope = "trueosfs"
+rewrite-std-imports = false
+
 [[bin]]
 name = "xerj"
 path = "src/main.rs"
@@ -94,7 +102,7 @@ debug-profiling = [
     "tikv-jemallocator/profiling",
 ]
 
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
+[target.'cfg(all(not(target_env = "msvc"), not(target_os = "trueos")))'.dependencies]
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 # `mallctl` itself, for the void `arena.<i>.purge` control that the ctl
@@ -102,7 +110,15 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 # `purge_all_jemalloc_arenas`). Already in the graph under
 # tikv-jemallocator and tikv-jemalloc-ctl, so this adds an edge, not a crate.
 tikv-jemalloc-sys = "0.6"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "trueos")'.dependencies]
+trueos = { path = "../../../../TRUEOS-Blueprints/api", default-features = false }
+# Tower 0.4 uses IndexMap's std default hasher. Its old build-script probe
+# cannot discover Cargo's separately built native std, so request it directly.
+indexmap_legacy = { package = "indexmap", version = "1.9.3", features = ["std"] }
 
 [target.'cfg(all(target_os = "linux", not(target_env = "msvc")))'.dependencies]
 jemalloc_pprof = { version = "0.8", features = ["symbolize"], optional = true }

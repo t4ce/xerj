@@ -1052,6 +1052,7 @@ fn pick_free_port(start: u16, tries: u16) -> Option<u16> {
 /// Windows), stdin closed, stdout and stderr appended to `log`. The child
 /// outlives this process and never receives its Ctrl-C. Shared with the
 /// background pull in `ask`.
+#[cfg(not(target_os = "trueos"))]
 pub(crate) fn spawn_detached(
     launcher: &NodeLauncher,
     args: &[String],
@@ -1076,7 +1077,25 @@ pub(crate) fn spawn_detached(
         .with_context(|| format!("spawn {}", launcher.exe.display()))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "trueos")]
+pub(crate) use self::spawn_detached_native as spawn_detached;
+
+/// Child Hulls end with their parent, while independent headless launches do
+/// not expose a receipt for this module's identity/status/stop contract.
+/// Refuse before touching the log or publishing a PID record.
+#[cfg(any(test, target_os = "trueos"))]
+pub(crate) fn spawn_detached_native(
+    _launcher: &NodeLauncher,
+    _args: &[String],
+    _log: &Path,
+) -> Result<Child> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "TRUEOS has no detached process ownership/control API for hub automatic nodes or background pulls; start xerj separately and pass --url or XERJ_URL for node queries",
+    ).into())
+}
+
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn detach(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
     cmd.process_group(0);
@@ -1392,7 +1411,7 @@ fn proc_start_token(pid: u32) -> Option<String> {
     })
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "trueos"))))]
 fn proc_state(pid: u32) -> ProcState {
     match Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "stat="])
@@ -1412,7 +1431,7 @@ fn proc_state(pid: u32) -> ProcState {
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "trueos"))))]
 fn proc_cmdline(pid: u32) -> Option<String> {
     let out = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
@@ -1427,7 +1446,7 @@ fn proc_cmdline(pid: u32) -> Option<String> {
 
 /// macOS and the BSDs: `ps -o lstart=` is the process start time to the second
 /// (`Tue Oct 14 13:55:12 2026`). The C locale keeps the spelling stable.
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "trueos"))))]
 fn proc_start_token(pid: u32) -> Option<String> {
     let out = Command::new("ps")
         .env("LC_ALL", "C")
@@ -1486,17 +1505,19 @@ fn proc_start_token(pid: u32) -> Option<String> {
     (!s.is_empty() && s.chars().all(|c| c.is_ascii_digit())).then_some(s)
 }
 
-#[cfg(not(any(unix, windows)))]
+// TRUEOS exposes self UUID/generation, not foreign process inspection. A PID
+// alone must never turn an unknown recorded owner into a dead or owned node.
+#[cfg(any(target_os = "trueos", not(any(unix, windows))))]
 fn proc_state(_pid: u32) -> ProcState {
     ProcState::Unknown
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(any(target_os = "trueos", not(any(unix, windows))))]
 fn proc_cmdline(_pid: u32) -> Option<String> {
     None
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(any(target_os = "trueos", not(any(unix, windows))))]
 fn proc_start_token(_pid: u32) -> Option<String> {
     None
 }
@@ -1650,7 +1671,7 @@ fn kill_hard(pid: u32) -> Result<()> {
     send_signal(pid, libc::SIGKILL)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn send_signal(pid: u32, sig: libc::c_int) -> Result<()> {
     // A single PID — never `-pid` (a whole process group).
     // SAFETY: plain syscall with integer arguments; `pid` was read from the
@@ -1666,6 +1687,14 @@ fn send_signal(pid: u32, sig: libc::c_int) -> Result<()> {
             Err(err).with_context(|| format!("signal pid {pid}"))
         }
     }
+}
+
+#[cfg(target_os = "trueos")]
+fn send_signal(_pid: u32, _sig: libc::c_int) -> Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "TRUEOS does not expose cross-Hull process signaling; use the owning native launcher to stop its node",
+    ).into())
 }
 
 #[cfg(windows)]
@@ -1821,6 +1850,25 @@ mod tests {
 
     fn silent_url() -> String {
         format!("http://127.0.0.1:{}", silent_port())
+    }
+
+    #[test]
+    fn native_detached_launch_refuses_before_creating_process_records_or_logs() {
+        let hub = tempfile::tempdir().unwrap();
+        let log = hub.path().join("new-parent/node.log");
+        let error = spawn_detached_native(&forbidden_launcher(), &[], &log).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert!(
+            !log.parent().unwrap().exists(),
+            "unsupported launch must not create log directories"
+        );
+        assert!(
+            !hub.path().join(NODE_PID_FILE).exists(),
+            "no child was created, so no PID may be recorded"
+        );
     }
 
     #[test]

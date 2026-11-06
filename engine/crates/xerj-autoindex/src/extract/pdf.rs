@@ -8,6 +8,8 @@
 //! 1536 MiB address-space cap. A kernel that rejects that cap (`EINVAL` /
 //! `EPERM`, as on macOS 27) still runs the worker. This is crash/resource
 //! isolation, not a security sandbox: the worker retains the user's authority.
+//! TRUEOS uses a child Hull with bounded output and a parent wall-clock
+//! timeout; per-worker address-space/CPU-time limits are unavailable.
 
 use super::{split_sections, ExtractStats, FieldOrigin, RawRecord, Sink};
 use anyhow::{anyhow, Context, Result};
@@ -17,6 +19,7 @@ use serde_json::{Map, Value};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "trueos"))]
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -269,6 +272,17 @@ struct ExtractionSpoolCapacity {
     descriptor_headroom: u64,
 }
 
+#[cfg(any(target_os = "trueos", test))]
+fn native_spool_capacity(capacity: ExtractionSpoolCapacity) -> ExtractionSpoolCapacity {
+    // A fixed admission policy independent of unavailable descriptor probes.
+    // Real file-open errors still take the existing safe reparse fallback.
+    ExtractionSpoolCapacity {
+        bytes: capacity.bytes.min(MAX_WORKER_OUTPUT as u64),
+        handles: 1,
+        ..capacity
+    }
+}
+
 impl ExtractionSpoolBudget {
     pub(crate) fn new(limit: u64, max_spools: u64) -> Arc<Self> {
         Arc::new(Self {
@@ -341,6 +355,9 @@ impl ExtractionSpoolBudget {
             pdf_workers,
             bulk_mb,
         );
+        #[cfg(target_os = "trueos")]
+        let capacity = native_spool_capacity(capacity);
+        #[cfg(not(target_os = "trueos"))]
         let warning = if capacity.bytes < MAX_WORKER_OUTPUT as u64 || capacity.handles == 0 {
             Some(format!(
                 "disabled to preserve {} MiB filesystem and {} descriptor headroom \
@@ -364,6 +381,15 @@ impl ExtractionSpoolBudget {
         } else {
             None
         };
+        #[cfg(target_os = "trueos")]
+        let warning = Some(if capacity.bytes < MAX_WORKER_OUTPUT as u64 {
+            format!(
+                "disabled to preserve {} MiB filesystem headroom; native descriptor usage is unavailable",
+                capacity.filesystem_headroom >> 20
+            )
+        } else {
+            "limited by native policy to one 32 MiB artifact and one parser Hull; descriptor usage is not measured and file-open errors fall back to reparsing".into()
+        });
         let capacity_status = if capacity.bytes < MAX_WORKER_OUTPUT as u64 || capacity.handles == 0
         {
             "disabled"
@@ -372,6 +398,7 @@ impl ExtractionSpoolBudget {
         } else {
             "enabled"
         };
+        #[cfg(not(target_os = "trueos"))]
         let capacity_reason = if descriptor_limit.is_none() || open_descriptors.is_none() {
             "descriptor_probe_unavailable"
         } else if capacity.bytes < MAX_WORKER_OUTPUT as u64 {
@@ -382,6 +409,12 @@ impl ExtractionSpoolBudget {
             "resource_share_limited"
         } else {
             "full_bounded_capacity"
+        };
+        #[cfg(target_os = "trueos")]
+        let capacity_reason = if capacity.bytes < MAX_WORKER_OUTPUT as u64 {
+            "filesystem_headroom"
+        } else {
+            "native_single_worker_policy"
         };
         let budget = Arc::new(Self {
             admission: Mutex::new(()),
@@ -413,7 +446,16 @@ impl ExtractionSpoolBudget {
             initial_descriptor_limit: descriptor_limit,
             initial_open_descriptors: open_descriptors,
             filesystem_headroom: Some(capacity.filesystem_headroom),
-            descriptor_headroom: Some(capacity.descriptor_headroom),
+            descriptor_headroom: {
+                #[cfg(target_os = "trueos")]
+                {
+                    None
+                }
+                #[cfg(not(target_os = "trueos"))]
+                {
+                    Some(capacity.descriptor_headroom)
+                }
+            },
             capacity_fallbacks: AtomicU64::new(0),
             io_fallbacks: AtomicU64::new(0),
             replay_verified: AtomicU64::new(0),
@@ -438,17 +480,20 @@ impl ExtractionSpoolBudget {
                 self.capacity_fallbacks.fetch_add(1, Ordering::Relaxed);
                 return Err("filesystem_admission_floor");
             }
-            let (Some(limit), Some(open)) = descriptor_snapshot_for(&live.state_dir) else {
-                self.capacity_fallbacks.fetch_add(1, Ordering::Relaxed);
-                return Err("descriptor_probe_failed");
-            };
-            if open
-                .saturating_add(live.descriptor_headroom)
-                .saturating_add(1)
-                > limit
+            #[cfg(not(target_os = "trueos"))]
             {
-                self.capacity_fallbacks.fetch_add(1, Ordering::Relaxed);
-                return Err("descriptor_admission_floor");
+                let (Some(limit), Some(open)) = descriptor_snapshot_for(&live.state_dir) else {
+                    self.capacity_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    return Err("descriptor_probe_failed");
+                };
+                if open
+                    .saturating_add(live.descriptor_headroom)
+                    .saturating_add(1)
+                    > limit
+                {
+                    self.capacity_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    return Err("descriptor_admission_floor");
+                }
             }
         }
         // Serialize the tiny accounting transition so a handle claim that is
@@ -689,7 +734,7 @@ fn derive_spool_capacity(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn descriptor_soft_limit() -> Option<u64> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
@@ -705,7 +750,7 @@ fn descriptor_soft_limit() -> Option<u64> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(any(not(unix), target_os = "trueos"))]
 fn descriptor_soft_limit() -> Option<u64> {
     None
 }
@@ -935,6 +980,41 @@ pub fn run_worker_cli() -> i32 {
     }
 }
 
+#[cfg(target_os = "trueos")]
+fn spawn_worker(path: &Path) -> Result<WorkerResponse> {
+    let output = super::native_worker::run(
+        "XERJ_PDF_WORKER_BIN",
+        &["__extract-pdf".into(), path.as_os_str().to_owned()],
+        MAX_WORKER_OUTPUT,
+        Duration::from_secs(WORKER_TIMEOUT_SECS.load(Ordering::Relaxed)),
+    )
+    .map_err(|error| {
+        if error
+            .chain()
+            .any(|cause| cause.to_string() == super::native_worker::START_FAILURE)
+        {
+            error.context(format!(
+                "{} for {}",
+                crate::state::PDF_WORKER_START_FAILURE,
+                path.display()
+            ))
+        } else {
+            error.context(format!(
+                "isolated PDF extraction failed for {}",
+                path.display()
+            ))
+        }
+    })?;
+    // The native child ABI has no numeric exit status. A complete, validated
+    // response is emitted only after successful parsing; no partial response
+    // is admitted after a crash or timeout.
+    let response: WorkerResponse = serde_json::from_slice(&output)
+        .context("native PDF worker did not produce a complete success response")?;
+    validate_response_identity(&response)?;
+    Ok(response)
+}
+
+#[cfg(not(target_os = "trueos"))]
 fn spawn_worker(path: &Path) -> Result<WorkerResponse> {
     // Trusted developer/test hook. The selected executable runs with the
     // invoking user's authority and must implement this private protocol.
@@ -1178,7 +1258,7 @@ fn read_capped(mut input: impl Read, cap: usize) -> Result<CappedRead> {
     Ok(CappedRead { prefix, overflow })
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn set_worker_memory_limit(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     // Probe in the parent so a refusal can be logged once on the progress
@@ -1207,7 +1287,7 @@ fn set_worker_memory_limit(command: &mut Command) {
 #[cfg(not(unix))]
 fn set_worker_memory_limit(_command: &mut Command) {}
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn terminate_worker_tree(child: &mut std::process::Child) {
     unsafe {
         libc::kill(-(child.id() as i32), libc::SIGKILL);
@@ -1216,7 +1296,7 @@ fn terminate_worker_tree(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn terminate_worker_descendants(process_group: u32) {
     unsafe {
         libc::kill(-(process_group as i32), libc::SIGKILL);
@@ -1232,13 +1312,18 @@ fn terminate_worker_tree(child: &mut std::process::Child) {
 #[cfg(not(unix))]
 fn terminate_worker_descendants(_process_group: u32) {}
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn containment_description() -> &'static str {
     if super::rlimit::current_address_space_is_capped(WORKER_ADDRESS_SPACE) {
         "fresh process; Unix process-group cleanup; 1536 MiB RLIMIT_AS; not a security sandbox"
     } else {
         "fresh process; Unix process-group cleanup; no RLIMIT_AS cap on this process; not a security sandbox"
     }
+}
+
+#[cfg(target_os = "trueos")]
+fn containment_description() -> &'static str {
+    "fresh native child Hull; bounded output and parent wall-clock timeout; no per-worker memory or CPU-time cap; stderr uses the platform log"
 }
 
 #[cfg(not(unix))]
@@ -1518,6 +1603,21 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
+
+    #[test]
+    fn native_spool_policy_is_bounded_without_inventing_descriptor_probes() {
+        let unknown = derive_spool_capacity(8 << 30, None, None, 8, 4, 24);
+        assert_eq!(unknown.handles, 0);
+        let native = super::native_spool_capacity(unknown);
+        assert_eq!(native.handles, 1);
+        assert_eq!(native.bytes, MAX_WORKER_OUTPUT as u64);
+        assert_eq!(native.filesystem_headroom, unknown.filesystem_headroom);
+        let constrained = super::native_spool_capacity(super::ExtractionSpoolCapacity {
+            bytes: 1024,
+            ..unknown
+        });
+        assert_eq!(constrained.bytes, 1024);
+    }
 
     fn write_prose_pdf(path: &std::path::Path) {
         let prose = "Quarterly revenue increased because subscription demand remained strong. \

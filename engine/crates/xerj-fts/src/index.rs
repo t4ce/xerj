@@ -32,7 +32,6 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use fst::{Map, MapBuilder};
-use memmap2::Mmap;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -43,6 +42,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use xerj_common::file_image::FileImage as Mmap;
 
 /// Longest field name that can remain literal inside an FTS side-car filename.
 ///
@@ -2828,7 +2828,8 @@ impl FtsIndexReader {
         if len == 0 {
             return Err(anyhow::anyhow!("empty file"));
         }
-        let mmap = unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {:?}", path))?;
+        let mmap = unsafe { xerj_common::file_image::open(path) }
+            .with_context(|| format!("read immutable file {:?}", path))?;
         Ok(mmap)
     }
 
@@ -2885,10 +2886,8 @@ impl FtsIndexReader {
 
     /// Heap bytes this reader retains, for the segment-cache budget.
     ///
-    /// Only *owned* allocations are counted. `Mmap` backings are deliberately
-    /// excluded: they are page-cache pages the kernel can reclaim, not heap the
-    /// process is responsible for, and charging them would make the budget
-    /// refuse to cache readers that cost almost nothing to hold.
+    /// Only owned allocations are counted. File images are owned on TRUEOS;
+    /// other platforms exclude their reclaimable memory-mapped pages.
     ///
     /// The dominant terms are the two decompressed blobs. A compressed `.post`
     /// (`ZPS1`) or `.meta` (`ZFM4`) cannot be mmap'd — it must be inflated into
@@ -2903,6 +2902,15 @@ impl FtsIndexReader {
             }
             if let FstData::Owned(m) = &f.fst {
                 total += m.as_fst().as_bytes().len() as u64;
+            }
+            #[cfg(target_os = "trueos")]
+            {
+                if let PostData::Mmap(bytes) = &f.post_data {
+                    total += bytes.len() as u64;
+                }
+                if let FstData::Mmap(map) = &f.fst {
+                    total += map.as_fst().as_bytes().len() as u64;
+                }
             }
             total += f.meta.flat_records.len() as u64;
             // `norms` is Vec<(u32, u16, u8)>, which pads to 8 bytes per element.

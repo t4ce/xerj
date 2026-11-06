@@ -187,14 +187,14 @@ const WORKER_BIN_ENV: &str = "XERJ_XLS_WORKER_BIN";
 /// `DIMENSIONS`/`SST` that slips the pre-filter, or any other attacker-driven
 /// `Vec::with_capacity`, hits this and fails the allocation inside the worker —
 /// where it only kills the worker — instead of aborting the indexer.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 const WORKER_ADDRESS_SPACE: u64 = 2 << 30; // 2 GiB
 
 /// CPU-time ceiling imposed on the worker (`RLIMIT_CPU`, seconds). A record
 /// stream crafted to spin inside calamine is bounded here; the kernel sends
 /// `SIGXCPU` at the soft limit and `SIGKILL` at the hard limit, either of which
 /// the parent reports as junk.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 const WORKER_CPU_SECONDS: u64 = 15;
 
 /// Wall-clock backstop for the whole worker, independent of CPU time — covers a
@@ -246,6 +246,8 @@ enum WorkerLine {
 /// OOM-kill or runaway there dies with the child and is counted as junk, and the
 /// parent never calls calamine on the raw file itself. Non-unix keeps the
 /// in-process bounded path as a documented best-effort (the dump is Linux).
+/// TRUEOS keeps the isolated parser in a native child Hull with bounded
+/// output and a wall-clock timeout, without claiming POSIX resource limits.
 pub fn extract(
     path: &Path,
     name: &Path,
@@ -315,7 +317,34 @@ fn extract_isolated(
 
 /// Run one worker to completion and return its buffered records plus the
 /// truncation flag, or an error describing why the file could not be trusted.
-#[cfg(unix)]
+#[cfg(target_os = "trueos")]
+fn run_worker(
+    path: &Path,
+    name: &Path,
+    per_sheet_limit: Option<u64>,
+) -> Result<(Vec<RawRecord>, bool)> {
+    use anyhow::Context;
+    let output = super::native_worker::run(
+        WORKER_BIN_ENV,
+        &[
+            WORKER_ARG.into(),
+            path.as_os_str().to_owned(),
+            name.as_os_str().to_owned(),
+            per_sheet_limit
+                .map_or_else(|| "none".into(), |limit| limit.to_string())
+                .into(),
+        ],
+        MAX_WORKER_OUTPUT,
+        WORKER_WALL_TIMEOUT,
+    )?;
+    // The final End line is emitted only after parsing succeeds. Native Hull
+    // lifecycle has no exit code, so require that success proof and reject
+    // partial or trailing output before exposing any rows to the sink.
+    parse_worker_output(&output)
+        .with_context(|| format!("parse native .xls worker result for {}", path.display()))
+}
+
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn run_worker(
     path: &Path,
     name: &Path,
@@ -463,7 +492,7 @@ fn parse_worker_output(bytes: &[u8]) -> Result<(Vec<RawRecord>, bool)> {
 
 /// Pre-exec child setup: own process group + address-space and CPU-time caps.
 /// Runs in the forked child; only async-signal-safe libc calls.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn worker_pre_exec() -> std::io::Result<()> {
     // SAFETY: `setpgid`/`setrlimit` are async-signal-safe and documented here.
     unsafe {
@@ -488,7 +517,7 @@ fn worker_pre_exec() -> std::io::Result<()> {
 /// spawn junked every `.xls` on macOS 27, where `setrlimit(RLIMIT_AS)` is
 /// rejected outright. `RLIMIT_CPU` stays strict: a failure there is still a
 /// failed spawn.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn set_worker_rlimits() -> std::io::Result<()> {
     // Set `$res`'s soft/hard limits to the requested values, each capped at the
     // inherited hard limit so the call never tries to RAISE a ceiling (which an
@@ -551,7 +580,7 @@ fn set_worker_rlimits() -> std::io::Result<()> {
 }
 
 /// SIGKILL the worker's whole process group (negative pid). Best effort.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn kill_group(pid: u32) {
     // SAFETY: plain libc FFI; an already-dead group is a harmless ESRCH.
     unsafe {
@@ -559,7 +588,7 @@ fn kill_group(pid: u32) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 struct Captured {
     bytes: Vec<u8>,
     overflow: bool,
@@ -567,7 +596,7 @@ struct Captured {
 
 /// Read `input` to EOF, keeping at most `cap` bytes and flagging overflow.
 /// Keeps draining past the cap so the child never blocks on a full pipe.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn read_capped(mut input: impl Read, cap: usize) -> Result<Captured> {
     use anyhow::Context;
     let mut bytes = Vec::new();
@@ -597,7 +626,7 @@ fn read_capped(mut input: impl Read, cap: usize) -> Result<Captured> {
 pub fn run_worker_cli() -> i32 {
     // Re-apply the resource caps the parent set via `pre_exec`, so the worker is
     // bounded even if it was launched directly (tests, a future caller).
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "trueos")))]
     if let Err(e) = set_worker_rlimits() {
         eprintln!(".xls worker could not set its resource limits: {e}");
         // Not fatal: the parent's `pre_exec` is the authoritative cap.

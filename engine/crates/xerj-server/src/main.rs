@@ -27,19 +27,25 @@
 // heap pages and never returns them to the OS, which causes RSS to grow
 // monotonically until the cgroup OOM-kills the process.  jemalloc handles
 // fragmentation actively and madvise()'s freed regions back.
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(not(target_env = "msvc"), not(target_os = "trueos")))]
 #[global_allocator]
 static ALLOC: ReportingJemalloc = ReportingJemalloc;
+
+// TRUEOS owns allocation through its Blueprint API. Its address space does not
+// expose the POSIX virtual-memory operations required by jemalloc.
+#[cfg(target_os = "trueos")]
+#[global_allocator]
+static ALLOC: trueos::TrueosAllocator = trueos::TrueosAllocator;
 
 /// Jemalloc plus a FATAL line when an allocation returns null.
 ///
 /// `handle_alloc_error` still runs afterwards and aborts, which raises
 /// SIGABRT. The line is written first, with `write(2)`, because the heap
 /// is the thing that just failed. SIGKILL cannot be reported.
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(not(target_env = "msvc"), not(target_os = "trueos")))]
 struct ReportingJemalloc;
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(not(target_env = "msvc"), not(target_os = "trueos")))]
 unsafe impl std::alloc::GlobalAlloc for ReportingJemalloc {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         let ptr = tikv_jemallocator::Jemalloc.alloc(layout);
@@ -85,6 +91,7 @@ unsafe impl std::alloc::GlobalAlloc for ReportingJemalloc {
 // (within noise, ~36k docs/s single-index bulk either way).
 #[cfg(all(
     not(target_env = "msvc"),
+    not(target_os = "trueos"),
     not(feature = "debug-profiling"),
     target_os = "linux"
 ))]
@@ -99,6 +106,7 @@ pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muz
 // — it still purges freed pages on allocator ticks — without the unsupported knob.
 #[cfg(all(
     not(target_env = "msvc"),
+    not(target_os = "trueos"),
     not(feature = "debug-profiling"),
     not(target_os = "linux")
 ))]
@@ -109,7 +117,11 @@ pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
 // Preserve the production decay policy. Merely compiling this feature enables
 // jemalloc's profiler; sampling remains inactive until the local controller
 // starts a bounded capture.
-#[cfg(all(not(target_env = "msvc"), feature = "debug-profiling"))]
+#[cfg(all(
+    not(target_env = "msvc"),
+    not(target_os = "trueos"),
+    feature = "debug-profiling"
+))]
 #[allow(non_upper_case_globals)]
 #[export_name = "_rjem_malloc_conf"]
 pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000,prof:true,prof_active:false,lg_prof_sample:19\0";
@@ -2410,8 +2422,8 @@ async fn run_cli_index(cmd: IndexCmdArgs) -> Result<()> {
         std::fs::File::open(&cmd.file).with_context(|| format!("open {}", cmd.file.display()))?;
     let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
     warn_neural_cli_index(&engine, &index, file_size).await;
-    let mmap: memmap2::Mmap = unsafe { memmap2::Mmap::map(&file) }
-        .with_context(|| format!("mmap {}", cmd.file.display()))?;
+    let mmap = unsafe { xerj_common::file_image::open(&cmd.file) }
+        .with_context(|| format!("read index input {}", cmd.file.display()))?;
     // Advise the kernel that we'll read sequentially and that we plan
     // to need the whole thing — lets it pre-fetch aggressively.
     #[cfg(target_os = "linux")]
@@ -2696,7 +2708,7 @@ async fn run_cli_index(cmd: IndexCmdArgs) -> Result<()> {
 /// `django` clone. Bump the soft limit to the hard limit, stepping down if the
 /// kernel (`kern.maxfilesperproc` on macOS) rejects the target. Best-effort:
 /// any failure here is non-fatal (the server just runs with the inherited cap).
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn raise_nofile_limit() {
     unsafe {
         let mut lim = libc::rlimit {
@@ -2758,7 +2770,7 @@ fn restore_default_sigpipe() {
 /// launchd default), so the earlier "pass the inherited hard limit back"
 /// version was a silent no-op there and the limit stayed at 256. Steps down by
 /// halving for the macOS `kern.maxfilesperproc` ceiling until one is accepted.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn nofile_plan(cur: libc::rlim_t, max: libc::rlim_t) -> Vec<(libc::rlim_t, libc::rlim_t)> {
     // Cap an "infinite" hard limit to concrete headroom (1,048,576).
     let hard = if max == libc::RLIM_INFINITY {
@@ -2781,7 +2793,7 @@ fn nofile_plan(cur: libc::rlim_t, max: libc::rlim_t) -> Vec<(libc::rlim_t, libc:
     plan
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, not(target_os = "trueos")))]
 mod nofile_tests {
     use super::nofile_plan;
 
@@ -2943,7 +2955,7 @@ fn report_fatal(bytes: &[u8]) {
     let _ = std::io::Write::write_all(&mut std::io::stderr(), bytes);
 }
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(not(target_env = "msvc"), not(target_os = "trueos")))]
 fn note_alloc_failure(size: usize, align: usize) {
     let mut buf = [0u8; 128];
     let n = format_alloc_failure(&mut buf, size, align);
@@ -3015,6 +3027,9 @@ fn install_fatal_reporter() {
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = fatal_signal as *const () as libc::sighandler_t;
+        // TRUEOS uses the zeroed mask as the empty set and does not expose
+        // sigemptyset. Other Unix targets retain their libc initializer.
+        #[cfg(not(target_os = "trueos"))]
         libc::sigemptyset(&mut action.sa_mask);
         // SA_ONSTACK: a stack overflow faults with no stack left, so the
         // handler must run on the alternate stack the Rust runtime sets up
@@ -3064,7 +3079,9 @@ fn main() -> Result<()> {
     #[cfg(unix)]
     restore_default_sigpipe();
 
-    #[cfg(unix)]
+    // TRUEOS supplies its descriptor capacity through the native registries;
+    // it has no process rlimit API to tune at startup.
+    #[cfg(all(unix, not(target_os = "trueos")))]
     raise_nofile_limit();
 
     // Dispatch before creating Tokio's pool so each PDF worker stays small.
@@ -3117,7 +3134,7 @@ fn main() -> Result<()> {
     if matches!(xerj_common::argv::subcommand().as_deref(), Some("mcp")) {
         let args: Vec<String> = xerj_common::argv::args_after_subcommand();
         let rt = build_runtime(2)?;
-        return rt.block_on(xerj_mcp::run(&args));
+        return block_on_entry(&rt, xerj_mcp::run(&args));
     }
     if matches!(
         xerj_common::argv::subcommand().as_deref(),
@@ -3125,7 +3142,7 @@ fn main() -> Result<()> {
     ) {
         let args = xerj_common::argv::args_after_subcommand();
         let rt = build_runtime(2)?;
-        std::process::exit(rt.block_on(xerj_mcp::run_batch_cli(&args)));
+        std::process::exit(block_on_entry(&rt, xerj_mcp::run_batch_cli(&args)));
     }
     if matches!(xerj_common::argv::subcommand().as_deref(), Some("init")) {
         let args = xerj_common::argv::args_after_subcommand();
@@ -3140,12 +3157,8 @@ fn main() -> Result<()> {
     // Cores from the resource policy, so `XERJ_NUM_CPUS` and a container CPU
     // quota reach the async runtime the same way they reach every pool (#240).
     let cores = xerj_common::resource::cores();
-    // ~8× cores, clamped to a sane band; env override wins.
-    let worker_threads = std::env::var("TOKIO_WORKER_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or_else(|| (cores * 8).clamp(64, 512));
+    let requested_workers = std::env::var("TOKIO_WORKER_THREADS").ok();
+    let worker_threads = runtime_worker_threads(cores, requested_workers.as_deref());
     let rt = build_runtime(worker_threads)?;
     run_to_exit(rt, async_main())
 }
@@ -3171,9 +3184,38 @@ const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// job unfinished here is no different from the SIGKILL or power loss the
 /// engine is already built to recover from.
 fn run_to_exit<F: std::future::Future>(rt: tokio::runtime::Runtime, fut: F) -> F::Output {
-    let out = rt.block_on(fut);
+    let out = block_on_entry(&rt, fut);
     rt.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
     out
+}
+
+/// Keep native child-Hull control on the entry thread while extraction work
+/// runs in Tokio's blocking pool. Runtime::block_on polls this wrapper on its
+/// caller; spawning it as a worker task would lose the required guest context.
+fn block_on_entry<F: std::future::Future>(rt: &tokio::runtime::Runtime, fut: F) -> F::Output {
+    #[cfg(target_os = "trueos")]
+    let fut = xerj_autoindex::extract::native_worker::with_broker(fut);
+    rt.block_on(fut)
+}
+
+/// Host pools retain the measured oversubscription policy. TRUEOS logical
+/// threads share native carriers and a finite admission budget, so its default
+/// follows the available cores up to four workers. An explicit positive
+/// TOKIO_WORKER_THREADS value takes precedence on every platform.
+fn runtime_worker_threads(cores: usize, requested: Option<&str>) -> usize {
+    requested
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&workers| workers > 0)
+        .unwrap_or_else(|| {
+            #[cfg(target_os = "trueos")]
+            {
+                cores.clamp(1, 4)
+            }
+            #[cfg(not(target_os = "trueos"))]
+            {
+                (cores * 8).clamp(64, 512)
+            }
+        })
 }
 
 /// Explicit worker-thread stack size for the production Tokio runtime.
@@ -3246,6 +3288,7 @@ const BLOCKING_THREAD_KEEP_ALIVE: std::time::Duration =
 /// keeps one extra thread, because `max_blocking_threads(0)` panics and a
 /// pool with no non-worker thread cannot run `block_in_place`. Past the
 /// cap a later call queues instead of calling `pthread_create`.
+#[cfg(not(target_os = "trueos"))]
 fn blocking_thread_cap(worker_threads: usize) -> usize {
     let workers = worker_threads.max(1);
     let spare_for_blocking_work = (workers / 8).max(2);
@@ -3256,11 +3299,18 @@ fn blocking_thread_cap(worker_threads: usize) -> usize {
     wanted.max(floor).min(1024.max(floor))
 }
 
-/// The `max_blocking_threads` value for [`blocking_thread_cap`]: every
-/// slot that is not already a worker. [`build_runtime`] starts all of
-/// them, so a later `spawn_blocking` finds the pool full and queues.
+/// Slots beyond the scheduler workers. Host builds warm every slot to avoid
+/// later sigaltstack failures; TRUEOS grows its native std pool on demand and
+/// bounds additional threads separately from its worker override.
 fn additional_blocking_threads(worker_threads: usize) -> usize {
-    blocking_thread_cap(worker_threads).saturating_sub(worker_threads.max(1))
+    #[cfg(target_os = "trueos")]
+    {
+        worker_threads.clamp(4, 8)
+    }
+    #[cfg(not(target_os = "trueos"))]
+    {
+        blocking_thread_cap(worker_threads).saturating_sub(worker_threads.max(1))
+    }
 }
 
 /// Build the production multi-threaded Tokio runtime with the deliberate worker
@@ -3277,6 +3327,9 @@ fn build_runtime(worker_threads: usize) -> Result<tokio::runtime::Runtime> {
         .thread_name("xerj-rt")
         .build()
         .context("build tokio runtime")?;
+    // Native TRUEOS std threads have no host sigaltstack allocation hazard.
+    // Admit blocking work as it arrives instead of reserving idle stacks.
+    #[cfg(not(target_os = "trueos"))]
     warm_blocking_pool(&rt, blocking);
     Ok(rt)
 }
@@ -3290,6 +3343,7 @@ fn build_runtime(worker_threads: usize) -> Result<tokio::runtime::Runtime> {
 /// is when the box is out of memory and the spawn aborts the process. A
 /// shortfall is logged. The server still boots: the cap remains, and a
 /// later spawn stops at it.
+#[cfg(not(target_os = "trueos"))]
 fn warm_blocking_pool(rt: &tokio::runtime::Runtime, spare: usize) {
     if spare == 0 {
         return;
@@ -4032,7 +4086,7 @@ mod decide_flag_tests {
 /// failed and the error was discarded. On Linux `background_thread:true`
 /// hid it; on macOS there is no background thread, and the drain freed
 /// nothing back to the OS.
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(not(target_env = "msvc"), not(target_os = "trueos")))]
 fn purge_all_jemalloc_arenas() -> Result<(), i32> {
     // SAFETY: the name is a NUL-terminated literal naming a real ctl node,
     // and a void control reads and writes nothing, so null pointers and a
@@ -4053,7 +4107,7 @@ fn purge_all_jemalloc_arenas() -> Result<(), i32> {
     }
 }
 
-#[cfg(all(test, not(target_env = "msvc")))]
+#[cfg(all(test, not(target_env = "msvc"), not(target_os = "trueos")))]
 mod allocator_purge_tests {
     use super::purge_all_jemalloc_arenas;
 
@@ -4076,7 +4130,40 @@ mod allocator_purge_tests {
 
 #[cfg(test)]
 mod runtime_tests {
-    use super::{additional_blocking_threads, blocking_thread_cap, build_runtime, run_to_exit};
+    #[cfg(not(target_os = "trueos"))]
+    use super::blocking_thread_cap;
+    use super::{additional_blocking_threads, build_runtime, run_to_exit, runtime_worker_threads};
+
+    #[test]
+    fn worker_override_takes_precedence_on_every_platform() {
+        assert_eq!(runtime_worker_threads(32, Some("16")), 16);
+        assert_eq!(runtime_worker_threads(32, Some("1")), 1);
+        for invalid in [Some("0"), Some("bad"), None] {
+            assert_eq!(
+                runtime_worker_threads(32, invalid),
+                runtime_worker_threads(32, None)
+            );
+        }
+    }
+
+    #[cfg(target_os = "trueos")]
+    #[test]
+    fn native_defaults_leave_thread_admission_for_engine_work() {
+        assert_eq!(runtime_worker_threads(0, None), 1);
+        assert_eq!(runtime_worker_threads(2, None), 2);
+        assert_eq!(runtime_worker_threads(32, None), 4);
+        assert_eq!(additional_blocking_threads(1), 4);
+        assert_eq!(additional_blocking_threads(4), 4);
+        assert_eq!(additional_blocking_threads(64), 8);
+    }
+
+    #[cfg(not(target_os = "trueos"))]
+    #[test]
+    fn host_worker_defaults_keep_the_measured_pool_sizes() {
+        assert_eq!(runtime_worker_threads(1, None), 64);
+        assert_eq!(runtime_worker_threads(32, None), 256);
+        assert_eq!(runtime_worker_threads(128, None), 512);
+    }
 
     /// SIGTERM → "Goodbye" → exit must not wait on a blocking job that is
     /// still running (in production: a background merge compressing a large
@@ -4145,6 +4232,7 @@ mod runtime_tests {
         assert!(sum > 0, "the stack-heavy worker task actually executed");
     }
 
+    #[cfg(not(target_os = "trueos"))]
     #[test]
     fn the_blocking_pool_is_wider_than_the_workers_and_stops_at_1024() {
         assert_eq!(blocking_thread_cap(2), 6);
@@ -5152,12 +5240,10 @@ async fn async_main() -> Result<()> {
     //      installed just below is what lets that drain actually lower RSS
     //      under jemalloc, which otherwise keeps freed pages resident.
     if storage_available {
-        // The purge-hook closure calls jemalloc mallctls, and jemalloc is not
-        // built on MSVC (the tikv crates are target-gated out in Cargo.toml),
-        // so the hook installs on every other target only — the engine's
-        // default no-op purge covers MSVC. The resource sampler below still
-        // runs everywhere: allocator_snapshot() has its own msvc fallback.
-        #[cfg(not(target_env = "msvc"))]
+        // Only jemalloc targets need its explicit purge hook. Other platform
+        // allocators use the engine's default hook; resource sampling still
+        // runs and reports unavailable allocator-specific counters as null.
+        #[cfg(all(not(target_env = "msvc"), not(target_os = "trueos")))]
         xerj_engine::engine::set_allocator_purge_hook(std::sync::Arc::new(|| {
             // Refresh the cached stats first (the epoch mallctl is what makes
             // the stats reads in the ingest-memory ledger coherent), then

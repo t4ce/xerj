@@ -86,6 +86,31 @@ fn max_hold(debounce: Duration) -> Duration {
 /// the corpus anyway.
 const MAX_TRACKED_PATHS: usize = 20_000;
 
+// TRUEOSFS exposes logical revisions rather than wall-clock modification
+// times. Compare bytes so same-size writes still invalidate cached digests.
+#[cfg(any(target_os = "trueos", test))]
+fn trueos_poll_config() -> notify::Config {
+    notify::Config::default()
+        .with_poll_interval(Duration::from_secs(2))
+        .with_compare_contents(true)
+}
+
+fn new_watcher<F: notify::EventHandler>(handler: F) -> notify::Result<notify::RecommendedWatcher> {
+    #[cfg(target_os = "trueos")]
+    {
+        notify::PollWatcher::new(handler, trueos_poll_config())
+    }
+    #[cfg(not(target_os = "trueos"))]
+    {
+        notify::recommended_watcher(handler)
+    }
+}
+
+#[cfg(target_os = "trueos")]
+const WATCH_BACKEND_NOTE: &str = "content polling every 2 s";
+#[cfg(not(target_os = "trueos"))]
+const WATCH_BACKEND_NOTE: &str = "no polling thread";
+
 /// `(size, mtime, inode)`. Never used to decide "unchanged" on its own — see
 /// the module docs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -873,7 +898,7 @@ pub fn run(cfg: IndexCfg) -> Result<i32> {
     let _ownership = crate::state::acquire_watch_ownership(&state_dir)?;
 
     let (tx, rx): (Sender<notify::Result<notify::Event>>, _) = channel();
-    let mut watcher = notify::recommended_watcher(tx).map_err(|error| {
+    let mut watcher = new_watcher(tx).map_err(|error| {
         anyhow::anyhow!(
             "this platform's filesystem watcher could not be started: {error}. \
              Re-run without --watch (a plain `xerj autoindex` needs no watcher), or run it on a \
@@ -887,7 +912,7 @@ pub fn run(cfg: IndexCfg) -> Result<i32> {
     let (watching, _) = sync_watches(&mut watcher, &mut watched, &cfg)?;
     pr.note(&format!(
         "watch: {watching} directories watched under {} (debounce {} ms); one watch per indexed \
-         directory, no polling thread",
+         directory, {WATCH_BACKEND_NOTE}",
         root.display(),
         cfg.debounce.as_millis()
     ));
@@ -988,6 +1013,37 @@ mod tests {
             event = event.add_path(path.to_path_buf());
         }
         Ok(event)
+    }
+
+    #[test]
+    #[cfg(not(target_os = "trueos"))]
+    fn content_polling_detects_a_same_size_rewrite_with_an_unchanged_timestamp() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("document.md");
+        fs::write(&path, b"old body").unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let (tx, rx) = channel();
+        let mut watcher =
+            notify::PollWatcher::new(tx, trueos_poll_config().with_manual_polling()).unwrap();
+        watcher.watch(&path, RecursiveMode::NonRecursive).unwrap();
+
+        // Prepare the replacement before publication so even a concurrent
+        // poll only observes the original timestamp and equal-length bytes.
+        let replacement = directory.path().join("replacement.md");
+        fs::write(&replacement, b"new body").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        watcher.poll().unwrap();
+
+        let changed = rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        assert_eq!(changed.paths, vec![path]);
+        assert_eq!(classify(&changed.kind), Signal::Changed);
     }
 
     #[test]

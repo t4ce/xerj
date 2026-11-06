@@ -12,11 +12,13 @@
 //!   alternative stack: os error 12`). The parent already observed `Ok`.
 //!   With `panic = "abort"` that child panic is not catchable.
 //!
-//! [`StdSpawn`] does not use `std::thread::Builder` on Unix. It calls
+//! [`StdSpawn`] does not use `std::thread::Builder` on Unix hosts. It calls
 //! `pthread_create` directly and runs the job on that thread, so a stack
 //! that cannot be reserved comes back as [`SpawnFailure`] and the child
 //! never executes std's signal-stack setup. Windows has no alternate-stack
 //! mmap; `CreateThread` failure is already an `Err` from `Builder::spawn`.
+//! TRUEOS uses its native Rust std thread backend, which has no Unix
+//! alternate-signal-stack setup, so it also uses `Builder::spawn` and std joins.
 //! The global allocator aborting on its own (`memory allocation of N bytes
 //! failed`) is a different failure and is not what this module handles.
 //!
@@ -41,11 +43,11 @@
 //! stack: autoindex workers, sync replay, an object-watch fetch, a mailbox
 //! splitter. [`std::thread::Builder::spawn_scoped`] still returns `Ok` and
 //! then panics in the child when the alternate signal stack cannot be
-//! mapped. [`scope`] starts those threads with the same `pthread_create`
-//! path and joins them before returning, so the borrow stays valid. A
+//! mapped. [`scope`] uses the same platform spawner and joins those threads
+//! before returning, so the borrow stays valid on every backend. A
 //! failed spawn is an [`io::Error`]. The closure is dropped unrun; the
 //! caller runs the work inline or records the error. This is not on the
-//! per-document path: one `pthread_create` per thread, then the job the
+//! per-document path: one platform thread spawn, then the job the
 //! caller already had.
 
 use std::io;
@@ -88,9 +90,10 @@ pub trait Spawn {
     fn spawn(&self, name: &str, job: BoxedJob) -> io::Result<SpawnedThread>;
 }
 
-/// `pthread_create` on Unix, `std::thread::Builder` elsewhere.
+/// `pthread_create` on Unix hosts, native `std::thread::Builder` on TRUEOS
+/// and non-Unix targets.
 ///
-/// Unix does not go through `std::thread`. That path panics in the child
+/// Unix hosts do not go through `std::thread`. That path panics in the child
 /// when the alternate signal stack cannot be mapped, after the parent has
 /// already been told the thread exists (#1122).
 #[derive(Debug, Clone, Copy, Default)]
@@ -98,7 +101,7 @@ pub struct StdSpawn;
 
 impl Spawn for StdSpawn {
     fn spawn(&self, name: &str, job: BoxedJob) -> io::Result<SpawnedThread> {
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "trueos")))]
         {
             // The OS name is applied on the new thread by the wrapper
             // `try_spawn_with` builds, before `job` runs. `std::thread`
@@ -107,7 +110,7 @@ impl Spawn for StdSpawn {
             let _ = name;
             spawn_pthread(job)
         }
-        #[cfg(not(unix))]
+        #[cfg(any(not(unix), target_os = "trueos"))]
         {
             spawn_std(name, job, None)
         }
@@ -117,7 +120,7 @@ impl Spawn for StdSpawn {
 /// [`StdSpawn`] with an explicit stack reservation.
 ///
 /// The in-process shard call needs 8 MiB: a search future overflows the
-/// 2 MiB helper stack. On Unix this still uses `pthread_create`, so a
+/// 2 MiB helper stack. On Unix hosts this still uses `pthread_create`, so a
 /// stack the OS will not reserve is an `Err` instead of a panic inside
 /// the child after `Builder::spawn` has already returned `Ok` (#1122).
 #[derive(Debug, Clone, Copy)]
@@ -127,12 +130,12 @@ pub struct StackSpawn {
 
 impl Spawn for StackSpawn {
     fn spawn(&self, name: &str, job: BoxedJob) -> io::Result<SpawnedThread> {
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "trueos")))]
         {
             let _ = name;
             spawn_pthread_with_stack(job, self.stack_bytes)
         }
-        #[cfg(not(unix))]
+        #[cfg(any(not(unix), target_os = "trueos"))]
         {
             spawn_std(name, job, Some(self.stack_bytes))
         }
@@ -140,9 +143,9 @@ impl Spawn for StackSpawn {
 }
 
 /// A thread started by [`Spawn::spawn`]. Dropping it detaches; [`join`](Self::join)
-/// waits. There is no `std::thread::JoinHandle` on Unix because that type
+/// waits. There is no `std::thread::JoinHandle` on Unix hosts because that type
 /// only exists for threads std started, and those are the ones that panic
-/// while mapping a signal stack.
+/// while mapping a signal stack. TRUEOS uses a std handle for its native backend.
 pub struct SpawnedThread {
     inner: SpawnedInner,
 }
@@ -154,12 +157,12 @@ impl std::fmt::Debug for SpawnedThread {
 }
 
 enum SpawnedInner {
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "trueos")))]
     Raw {
         thread: libc::pthread_t,
         joined: bool,
     },
-    #[cfg(not(unix))]
+    #[cfg(any(not(unix), target_os = "trueos"))]
     Std(Option<std::thread::JoinHandle<()>>),
     /// Spawn was refused or failed and the caller still needs a handle that
     /// `join`s immediately (a background loop that never started).
@@ -188,7 +191,7 @@ impl SpawnedThread {
 
     fn join_inner(&mut self) -> std::thread::Result<()> {
         match &mut self.inner {
-            #[cfg(unix)]
+            #[cfg(all(unix, not(target_os = "trueos")))]
             SpawnedInner::Raw { thread, joined } => {
                 if !*joined {
                     *joined = true;
@@ -201,7 +204,7 @@ impl SpawnedThread {
                 }
                 Ok(())
             }
-            #[cfg(not(unix))]
+            #[cfg(any(not(unix), target_os = "trueos"))]
             SpawnedInner::Std(handle) => match handle.take() {
                 Some(handle) => handle.join(),
                 None => Ok(()),
@@ -213,7 +216,7 @@ impl SpawnedThread {
 
 impl Drop for SpawnedThread {
     fn drop(&mut self) {
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "trueos")))]
         if let SpawnedInner::Raw { thread, joined } = &mut self.inner {
             if !*joined {
                 *joined = true;
@@ -241,10 +244,10 @@ impl Drop for SpawnedThread {
 // `&SpawnedThread` cannot perform either call (`Debug` prints a
 // constant string), so `Sync` is sound and matches the automatic impl
 // glibc already provides and `std::thread::JoinHandle`.
-#[cfg(target_env = "musl")]
+#[cfg(all(unix, target_env = "musl", not(target_os = "trueos")))]
 unsafe impl Send for SpawnedThread {}
 // SAFETY: same as `Send` above. Shared references do not join or detach.
-#[cfg(target_env = "musl")]
+#[cfg(all(unix, target_env = "musl", not(target_os = "trueos")))]
 unsafe impl Sync for SpawnedThread {}
 
 const _: () = {
@@ -502,13 +505,13 @@ where
     // though the spawner dropped the boxed wrapper.
     let slot = Arc::new(Mutex::new(Some(f)));
     let thread_slot = Arc::clone(&slot);
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "trueos")))]
     let comm = os_comm_name(name);
     let wrapper: BoxedJob = Box::new(move || {
         // Before the caller's job, so a panic in the job still shows the
         // OS thread name. std would have set this and then mmap'd a signal
         // stack; that mmap is the panic #1122 hit.
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "trueos")))]
         set_os_name(&comm);
         let job = thread_slot
             .lock()
@@ -872,7 +875,7 @@ unsafe fn erase_fnonce_returning_lifetime<'scope, T: Send + 'static>(
 
 /// Linux `TASK_COMM_LEN`, including the trailing NUL. `std::thread` truncates
 /// to the same width for the OS name; the full name still goes in our logs.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn os_comm_name(name: &str) -> [u8; 16] {
     let mut buf = [0u8; 16];
     let bytes = if name.is_empty() {
@@ -885,7 +888,7 @@ fn os_comm_name(name: &str) -> [u8; 16] {
     buf
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn set_os_name(bytes: &[u8; 16]) {
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     {
@@ -918,7 +921,10 @@ fn set_os_name(bytes: &[u8; 16]) {
 /// there (#1122). The comm is at most 15 bytes (`xerj-scan-0` fits).
 /// Elsewhere this is the std thread name, which `Builder::name` did set.
 pub fn current_thread_name() -> Option<String> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(
+        not(target_os = "trueos"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
     {
         let mut buf = [0u8; 16];
         // SAFETY: `buf` is writable for `buf.len()` bytes. On success
@@ -933,7 +939,10 @@ pub fn current_thread_name() -> Option<String> {
         let end = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
         String::from_utf8(buf[..end].to_vec()).ok()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(any(
+        target_os = "trueos",
+        not(any(target_os = "linux", target_os = "macos"))
+    ))]
     {
         std::thread::current().name().map(str::to_owned)
     }
@@ -942,13 +951,13 @@ pub fn current_thread_name() -> Option<String> {
 /// Same default std uses for a spawned thread (`2 MiB` on Tier-1). A larger
 /// stack would reserve more address space than the path this replaces,
 /// which is the opposite of what a memory-pressure spawn should do.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 const HELPER_STACK_BYTES: usize = 2 * 1024 * 1024;
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 struct AttrGuard(libc::pthread_attr_t);
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 impl Drop for AttrGuard {
     fn drop(&mut self) {
         // SAFETY: the guard is built only after `pthread_attr_init` returned
@@ -959,12 +968,12 @@ impl Drop for AttrGuard {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn spawn_pthread(job: BoxedJob) -> io::Result<SpawnedThread> {
     spawn_pthread_with_stack(job, HELPER_STACK_BYTES)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn spawn_pthread_with_stack(job: BoxedJob, stack_bytes: usize) -> io::Result<SpawnedThread> {
     // A second box so the fat pointer of `dyn FnOnce` survives the trip
     // through `pthread_create`'s thin `void*`. This is the same shape std
@@ -1018,7 +1027,7 @@ fn spawn_pthread_with_stack(job: BoxedJob, stack_bytes: usize) -> io::Result<Spa
     })
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 extern "C" fn thread_main(ptr: *mut libc::c_void) -> *mut libc::c_void {
     // SAFETY: the parent leaked this box into pthread_create, and this
     // thread is the unique consumer. The closure is `Send`.
@@ -1027,7 +1036,7 @@ extern "C" fn thread_main(ptr: *mut libc::c_void) -> *mut libc::c_void {
     std::ptr::null_mut()
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn run_job(job: BoxedJob) {
     // Unwinding out of `extern "C"` is undefined. Release builds abort
     // inside the job (`panic = "abort"`) and never reach the catch.
@@ -1039,11 +1048,12 @@ fn run_job(job: BoxedJob) {
     job();
 }
 
-#[cfg(not(unix))]
+#[cfg(any(not(unix), target_os = "trueos"))]
 fn spawn_std(name: &str, job: BoxedJob, stack_bytes: Option<usize>) -> io::Result<SpawnedThread> {
-    // Windows (and any other non-Unix target) has no sigaltstack mmap.
-    // `CreateThread` failure is an `Err` from `Builder::spawn`, which is
-    // the degrade path. A global-allocator abort is out of scope here.
+    // TRUEOS uses its native Rust std thread backend, with no Unix
+    // sigaltstack setup. Windows and other non-Unix targets use std too.
+    // Builder failures follow the existing closure-recovery path; a
+    // global-allocator abort is out of scope here.
     let mut builder = std::thread::Builder::new().name(name.to_owned());
     if let Some(stack_bytes) = stack_bytes {
         builder = builder.stack_size(stack_bytes);
@@ -1196,7 +1206,7 @@ mod tests {
             .expect("detacher thread");
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "trueos")))]
     #[test]
     fn a_spawned_helper_does_not_install_an_alternate_signal_stack() {
         // #1122: std::thread::Builder's child calls
@@ -1241,7 +1251,7 @@ mod tests {
     /// go through `std::thread::Builder`: the child's sigaltstack mmap is
     /// what aborted the node, and an 8 MiB stack is a larger mmap than the
     /// 2 MiB helper.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "trueos")))]
     #[test]
     fn an_eight_mebibyte_stack_does_not_install_an_alternate_signal_stack() {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1488,7 +1498,7 @@ mod tests {
         });
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "trueos")))]
     #[test]
     fn a_scoped_helper_does_not_install_an_alternate_signal_stack() {
         // Same regression as `a_spawned_helper_does_not_install_an_alternate_signal_stack`.
@@ -1531,7 +1541,7 @@ mod tests {
     /// `(rc, ss_flags)` from `sigaltstack`. `SS_DISABLE` set means the
     /// thread has no alternate signal stack — the mapping `std::thread`
     /// panics on if it cannot be created.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "trueos")))]
     fn alternate_signal_stack_flags() -> (libc::c_int, libc::c_int) {
         let mut stack = unsafe { std::mem::zeroed::<libc::stack_t>() };
         // SAFETY: a null current-stack pointer only reads the calling

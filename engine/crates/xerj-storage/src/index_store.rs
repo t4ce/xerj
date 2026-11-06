@@ -26,6 +26,13 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+#[cfg(not(target_os = "trueos"))]
+type CachedSegmentReader = Arc<crate::segment::SegmentReader>;
+// Buffered file images belong to the guest heap. Reuse active readers without
+// pinning every segment's bytes after its final query releases it.
+#[cfg(target_os = "trueos")]
+type CachedSegmentReader = std::sync::Weak<crate::segment::SegmentReader>;
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
@@ -609,7 +616,7 @@ pub struct IndexStore {
     /// per segment_id in a DashMap.  The reader owns its mmap and does
     /// CRC validation exactly once at open time.  Querying threads
     /// only do an `Arc::clone`, no file I/O.
-    seg_reader_cache: dashmap::DashMap<String, Arc<crate::segment::SegmentReader>>,
+    seg_reader_cache: dashmap::DashMap<String, CachedSegmentReader>,
     /// Millis-since-epoch of the last WAL maintenance (checkpoint +
     /// rotate + prune) call.  `finalize_flush_with_publisher` used to
     /// run this loop for ALL 16 WAL shards on EVERY segment flush.
@@ -3645,7 +3652,12 @@ impl IndexStore {
     /// no CRC work.
     pub fn open_segment_arc(&self, segment_id: &str) -> Result<Arc<crate::segment::SegmentReader>> {
         if let Some(entry) = self.seg_reader_cache.get(segment_id) {
+            #[cfg(not(target_os = "trueos"))]
             return Ok(Arc::clone(entry.value()));
+            #[cfg(target_os = "trueos")]
+            if let Some(reader) = entry.value().upgrade() {
+                return Ok(reader);
+            }
         }
         let snap = self.snapshot.load();
         // Merge-race fix (2026-07): a miss against the CURRENT snapshot no
@@ -3722,8 +3734,12 @@ impl IndexStore {
             }
         };
         let arc = Arc::new(reader);
+        #[cfg(not(target_os = "trueos"))]
         self.seg_reader_cache
             .insert(segment_id.to_string(), Arc::clone(&arc));
+        #[cfg(target_os = "trueos")]
+        self.seg_reader_cache
+            .insert(segment_id.to_string(), Arc::downgrade(&arc));
         Ok(arc)
     }
 

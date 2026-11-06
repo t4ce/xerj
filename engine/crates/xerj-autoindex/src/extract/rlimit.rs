@@ -13,8 +13,11 @@
 //! process group, under whatever limit it inherited. Any other errno still
 //! fails that one spawn. Linux keeps the cap: the probe there succeeds and
 //! the child installs it.
+//! TRUEOS uses child Hull isolation instead and reports the missing per-worker
+//! caps explicitly; no resource-limit syscalls are attempted on that target.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_os = "trueos"))]
 use std::sync::OnceLock;
 
 /// Byte value the parent probes with. Matches the PDF worker cap. A kernel
@@ -30,8 +33,16 @@ warning: this OS refused setrlimit(RLIMIT_AS) for isolated extraction workers; \
 they still start without that address-space cap. The cap is crash isolation, \
 not a security boundary.";
 
+#[cfg(not(target_os = "trueos"))]
 static CAP_SUPPORTED: OnceLock<bool> = OnceLock::new();
 static CAP_WARNING_ANNOUNCED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "trueos")]
+static NATIVE_WORKER_USED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "trueos")]
+pub(super) fn native_worker_started() {
+    NATIVE_WORKER_USED.store(true, Ordering::Relaxed);
+}
 
 /// What one `setrlimit(RLIMIT_AS)` call did. `Skipped` is a successful spawn
 /// decision: the platform will not install the cap.
@@ -59,6 +70,7 @@ pub(crate) fn classify_address_space_cap(rc: i32, errno: i32) -> AddressSpaceCap
 
 /// Install `bytes` as both the soft and hard `RLIMIT_AS`. Safe to call from
 /// `pre_exec`: on the refusal path it reads `errno` and does not allocate.
+#[cfg(not(target_os = "trueos"))]
 pub(crate) fn apply_address_space_cap(bytes: u64) -> AddressSpaceCap {
     let limit = libc::rlimit {
         rlim_cur: bytes as libc::rlim_t,
@@ -78,6 +90,7 @@ pub(crate) fn apply_address_space_cap(bytes: u64) -> AddressSpaceCap {
 /// modified. An inconclusive probe (fork failure, or an errno other than
 /// `EINVAL`/`EPERM`) answers `true`, and the worker's `pre_exec` still skips
 /// a later benign refusal.
+#[cfg(not(target_os = "trueos"))]
 pub(crate) fn address_space_cap_supported() -> bool {
     *CAP_SUPPORTED.get_or_init(probe_address_space_cap)
 }
@@ -85,9 +98,20 @@ pub(crate) fn address_space_cap_supported() -> bool {
 /// The progress note for a refused cap, the first time it is asked after the
 /// probe has run and failed. `None` before the probe, when the cap was
 /// accepted, and on every call after the first announcement.
+#[cfg(not(target_os = "trueos"))]
 pub(crate) fn take_address_space_cap_warning() -> Option<&'static str> {
     let supported = *CAP_SUPPORTED.get()?;
     warning_if_refused(supported, &CAP_WARNING_ANNOUNCED)
+}
+
+#[cfg(target_os = "trueos")]
+pub(crate) fn take_address_space_cap_warning() -> Option<&'static str> {
+    if !NATIVE_WORKER_USED.load(Ordering::Relaxed)
+        || CAP_WARNING_ANNOUNCED.swap(true, Ordering::Relaxed)
+    {
+        return None;
+    }
+    Some("native extraction uses one isolated child Hull at a time with bounded output and a wall-clock timeout; per-worker address-space/CPU-time caps and captured stderr are unavailable")
 }
 
 pub(crate) fn warning_if_refused(supported: bool, announced: &AtomicBool) -> Option<&'static str> {
@@ -100,6 +124,7 @@ pub(crate) fn warning_if_refused(supported: bool, announced: &AtomicBool) -> Opt
 /// Whether the calling process currently has `RLIMIT_AS` pinned to `bytes`.
 /// The worker reports this in its containment string, so a platform that
 /// refused the cap does not claim the cap is in force.
+#[cfg(not(target_os = "trueos"))]
 pub(crate) fn current_address_space_is_capped(bytes: u64) -> bool {
     let mut current = libc::rlimit {
         rlim_cur: 0,
@@ -143,6 +168,7 @@ pub(crate) fn errno_raw() -> i32 {
     }
 }
 
+#[cfg(not(target_os = "trueos"))]
 fn probe_address_space_cap() -> bool {
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -168,7 +194,7 @@ fn probe_address_space_cap() -> bool {
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "trueos")))]
 mod tests {
     use super::*;
 

@@ -67,8 +67,9 @@ pub enum PidState {
 
 /// The same probe the engine uses for `node.lock` recovery
 /// (`xerj-engine/src/node_lock.rs` `pid_liveness`). `kill(pid, 0)` on Unix,
-/// `OpenProcess` + `WaitForSingleObject` on Windows.
-#[cfg(unix)]
+/// `OpenProcess` + `WaitForSingleObject` on Windows. TRUEOS does not expose
+/// cross-Hull PID lookup; its reused VM-slot PIDs are not lifetime identities.
+#[cfg(all(unix, not(target_os = "trueos")))]
 pub fn pid_state(pid: u32) -> PidState {
     let Some(pid) = i32::try_from(pid).ok().filter(|pid| *pid > 0) else {
         return PidState::Unknown;
@@ -132,7 +133,7 @@ pub fn pid_state(pid: u32) -> PidState {
     }
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(any(target_os = "trueos", not(any(unix, windows))))]
 pub fn pid_state(_pid: u32) -> PidState {
     PidState::Unknown
 }
@@ -318,6 +319,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "trueos"))]
     fn pid_state_sees_this_process_alive_and_a_reaped_child_dead() {
         assert_eq!(pid_state(std::process::id()), PidState::Alive);
         #[cfg(unix)]

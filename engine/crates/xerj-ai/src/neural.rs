@@ -158,8 +158,17 @@ impl NeuralEmbedder {
             .map_err(|e| anyhow!("configure tokenizer truncation: {e}"))?;
 
         let device = Device::Cpu;
+        #[cfg(target_os = "trueos")]
+        let vb = VarBuilder::from_buffered_safetensors(
+            std::fs::read(&weights_path)
+                .with_context(|| format!("read weights {}", weights_path.display()))?,
+            DTYPE,
+            &device,
+        )
+        .with_context(|| format!("load weights {}", weights_path.display()))?;
         // Safetensors is memory-mapped; the file must outlive the model, which
         // it does (candle copies tensors into the VarBuilder-backed model).
+        #[cfg(not(target_os = "trueos"))]
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&weights_path), DTYPE, &device)
                 .with_context(|| format!("map weights {}", weights_path.display()))?

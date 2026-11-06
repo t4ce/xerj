@@ -55,6 +55,7 @@ pub mod error;
 pub mod feedback;
 pub mod field_coercion;
 pub mod field_report;
+pub mod file_image;
 pub mod fsio;
 pub mod home;
 pub mod hub;

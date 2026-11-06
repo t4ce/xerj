@@ -186,5 +186,8 @@ aws-smithy-http-client = { workspace = true }
 # is driven with `block_on`. No async leaks past `src/objsource.rs`.
 tokio = { workspace = true }
 
+[target.'cfg(target_os = "trueos")'.dependencies]
+trueos = { path = "../../../../TRUEOS-Blueprints/api", default-features = false }
+
 [dev-dependencies]
 base64 = "0.23.1"

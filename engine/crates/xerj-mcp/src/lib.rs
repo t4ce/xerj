@@ -111,6 +111,8 @@ mod batch_cli;
 mod def;
 mod hub;
 mod map;
+#[cfg(any(target_os = "trueos", test))]
+mod native_stdio;
 mod status;
 mod token_budget;
 
@@ -415,7 +417,11 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
     }
 
     // stdout is the JSON-RPC channel; stderr is for logs only.
-    serve(ctx, BufReader::new(tokio::io::stdin()), tokio::io::stdout()).await
+    #[cfg(not(target_os = "trueos"))]
+    let (stdin, stdout) = (tokio::io::stdin(), tokio::io::stdout());
+    #[cfg(target_os = "trueos")]
+    let (stdin, stdout) = (native_stdio::Stdin::new(), native_stdio::Stdout::new());
+    serve(ctx, BufReader::new(stdin), stdout).await
 }
 
 /// The JSON-RPC loop over newline-delimited messages, apart from the process'
