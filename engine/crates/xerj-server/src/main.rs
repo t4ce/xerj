@@ -1086,6 +1086,7 @@ fn load_config_with_data_dir_origin(args: &CliArgs) -> Result<(Config, startup_d
 /// open it; the explicit `set_permissions` afterwards tightens files that
 /// already exist from an earlier version (a create mode never applies to a
 /// pre-existing file).
+#[cfg(not(target_os = "trueos"))]
 fn write_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
@@ -1108,6 +1109,11 @@ fn write_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "trueos")]
+fn write_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    xerj_common::native_secret::write(path, contents)
+}
+
 fn ensure_admin_key(cfg: &mut Config) -> Result<()> {
     if !cfg.auth.enabled || !cfg.auth.admin_api_key.is_empty() {
         return Ok(());
@@ -1124,7 +1130,11 @@ fn ensure_admin_key(cfg: &mut Config) -> Result<()> {
     // Only a well-formed 64-char hex string (the shape this function itself
     // always produces) is trusted; anything else falls through to a fresh
     // generation rather than risk starting up with a garbled credential.
-    if let Ok(existing) = std::fs::read_to_string(&key_path) {
+    #[cfg(not(target_os = "trueos"))]
+    let existing = std::fs::read_to_string(&key_path);
+    #[cfg(target_os = "trueos")]
+    let existing = xerj_common::native_secret::read_to_string(&key_path);
+    if let Ok(existing) = existing {
         let existing = existing.trim();
         if existing.len() == 64 && existing.bytes().all(|b| b.is_ascii_hexdigit()) {
             cfg.auth.admin_api_key = existing.to_string();
@@ -1139,10 +1149,17 @@ fn ensure_admin_key(cfg: &mut Config) -> Result<()> {
     // Persist before announcing. The notice names the path and never the
     // secret: stdout is what agents capture, and a first-run banner that
     // prints the key lands in those logs (field report 2026-10-17).
-    if let Err(e) = std::fs::create_dir_all(data_dir).and_then(|_| {
+    #[cfg(not(target_os = "trueos"))]
+    let persisted = std::fs::create_dir_all(data_dir).and_then(|_| {
         // 0600 — this file IS the admin credential (RC4 W2 #21).
         write_secret_file(&key_path, key.as_bytes())
-    }) {
+    });
+    #[cfg(target_os = "trueos")]
+    let persisted = write_secret_file(&key_path, key.as_bytes());
+    if let Err(e) = persisted {
+        #[cfg(target_os = "trueos")]
+        anyhow::bail!("cannot persist the native admin key to {}: {e}; use the host-provisioned private XERJ workspace", key_path.display());
+        #[cfg(not(target_os = "trueos"))]
         warn!(
             "could not persist admin key to {}: {e}. The key was not printed. \
              Fix the data directory and restart so a key can be written.",
@@ -1201,7 +1218,7 @@ fn ensure_tls_cert(cfg: &mut Config) -> Result<()> {
         // operator-supplied key may be group-readable by design (e.g. an
         // ssl-cert group shared across services), so warn without touching
         // their permissions.
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "trueos")))]
         {
             use std::os::unix::fs::PermissionsExt;
             let key_path = Path::new(&cfg.tls.key_path);
@@ -1236,6 +1253,16 @@ fn ensure_tls_cert(cfg: &mut Config) -> Result<()> {
                         );
                     }
                 }
+            }
+        }
+        #[cfg(target_os = "trueos")]
+        {
+            let key_path = Path::new(&cfg.tls.key_path);
+            let autogen = Path::new(&cfg.server.data_dir).join("xerj.key");
+            if key_path.canonicalize().ok().zip(autogen.canonicalize().ok())
+                .is_some_and(|(key, generated)| key == generated)
+            {
+                xerj_common::native_secret::validate(key_path)?;
             }
         }
         return Ok(());

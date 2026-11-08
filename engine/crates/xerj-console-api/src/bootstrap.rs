@@ -108,7 +108,10 @@ fn load_or_init_master_key(data_dir: &Path) -> ConsoleResult<[u8; 32]> {
 
     let path = data_dir.join(MASTER_KEY_FILENAME);
     if path.exists() {
+        #[cfg(not(target_os = "trueos"))]
         let raw = std::fs::read_to_string(&path)?;
+        #[cfg(target_os = "trueos")]
+        let raw = xerj_common::native_secret::read_to_string(&path)?;
         let trimmed = raw.trim();
         let bytes = hex_decode(trimmed).ok_or_else(|| {
             ConsoleApiError::Internal(format!(
@@ -132,13 +135,18 @@ fn load_or_init_master_key(data_dir: &Path) -> ConsoleResult<[u8; 32]> {
     let mut key = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut key);
     let hex = hex_encode(&key);
-    std::fs::write(&path, &hex)?;
-    set_owner_readable_only(&path)?;
+    #[cfg(not(target_os = "trueos"))]
+    {
+        std::fs::write(&path, &hex)?;
+        set_owner_readable_only(&path)?;
+    }
+    #[cfg(target_os = "trueos")]
+    xerj_common::native_secret::write(&path, hex.as_bytes())?;
     tracing::info!(path = %path.display(), "generated xerj-console master key");
     Ok(key)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn set_owner_readable_only(p: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut perm = std::fs::metadata(p)?.permissions();
@@ -146,7 +154,7 @@ fn set_owner_readable_only(p: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(p, perm)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(target_os = "trueos")))]
 fn set_owner_readable_only(_p: &Path) -> std::io::Result<()> {
     Ok(())
 }

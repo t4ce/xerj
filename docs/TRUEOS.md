@@ -49,6 +49,13 @@ stores data in `/apps/xerj/data`, and disables feedback for this trial. Stop
 the service Hull to stop its engine child. It retains normal embedding and
 decision defaults; compiled neural backends can be selected in another launch.
 
+The current kernel provisions persistent private workspaces for `xerj` and
+`xerj-service` before guest entry. It supplies the host-owned
+`TRUEOS_PRIVATE_APP_ROOT` marker and a protected `.trueos-private-root`
+reference file. Credential creation and reuse check the real native access
+key against that reference. A generated admin, console or TLS secret must
+stay below `/apps/xerj`; a missing ownership stamp fails startup.
+
 Launching the bare `xerj` name in Shell3 starts the full engine with normal
 authentication and data-directory defaults. TRUEOS defaults to one to four
 Tokio workers according to available cores, with four to eight additional
@@ -162,14 +169,16 @@ packaged-default MCP service activation, memory and persistence after restart. S
 with `xerj-smoke v=1 stage=end ok=true`; a compiled probe alone establishes
 none of those runtime results. The probe stops its fixture engine/MCP/Codex
 children; the independent normal XERJ service remains running.
+Its synthetic engine data is private to XERJ under `/apps/xerj/smoke/<run>`;
+the probe keeps its corpus and evidence separately and inspects engine state
+through the public HTTP/MCP interfaces.
 
-The separate opt-in `openssl-check` feature checks RNG, P256/SHA256 signing and tamper rejection, a fixed
-SHA256 digest and UTC formatting on two native threads and the entry thread.
-It is off by default and requires a native OpenSSL provider update after the
-Unix ABI removal; native execution has not been verified. Historical host tests
-have passed against the native-configured OpenSSL archives, including RNG
-failure with CPU entropy masked, plus 155,949 utility regression checks.
-Those host results do not establish native passkey or engine behavior.
+The default `openssl-check` feature checks the production native crypto provider:
+RNG, P256/SHA256 signing and tamper rejection, a fixed SHA256 digest and UTC
+formatting on two native threads and the entry thread. The package must pass
+the native import guards; a live `crypto_native` marker records this phase.
+Host crypto and WebAuthn checks remain separate evidence and do not establish
+native passkey or engine behavior.
 
 Use the same process-shaped launcher to run these argv lists against the node:
 

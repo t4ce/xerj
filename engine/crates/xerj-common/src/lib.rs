@@ -64,6 +64,8 @@ pub mod localauth;
 pub mod loopback_test;
 pub mod metrics;
 pub mod net;
+#[cfg(any(target_os = "trueos", test))]
+pub mod native_secret;
 pub mod nodedir;
 pub mod packed_f32;
 pub mod resource;

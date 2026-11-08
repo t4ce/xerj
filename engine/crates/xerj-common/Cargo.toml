@@ -36,5 +36,8 @@ sha2 = "0.10"
 serde_json_canonicalizer = "0.3.2"
 memmap2.workspace = true
 
+[target.'cfg(target_os = "trueos")'.dependencies]
+tempfile.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

@@ -69,6 +69,9 @@ fn read_local_auth() -> anyhow::Result<String> {
         )
     })?;
     anyhow::ensure!(metadata.len() <= 128, "invalid local XERJ admin key file");
+    #[cfg(target_os = "trueos")]
+    let key = xerj_common::native_secret::read_to_string(std::path::Path::new(KEY_PATH))?;
+    #[cfg(not(target_os = "trueos"))]
     let key = std::fs::read_to_string(KEY_PATH)?;
     let key = key.trim();
     anyhow::ensure!(
