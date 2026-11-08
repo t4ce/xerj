@@ -71,6 +71,17 @@ pub(super) fn read(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {
     );
     Ok(Some(bytes))
 }
+#[cfg(target_os = "trueos")]
+pub(super) fn private_dir(_path: &Path) -> Result<()> {
+    // Access-key equivalence does not establish Unix owner-only privacy. Do
+    // not create a public/inherited-key directory and call it mode 0700.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Claude Code session hooks need private-directory provisioning unavailable on TRUEOS",
+    ).into())
+}
+
+#[cfg(not(target_os = "trueos"))]
 pub(super) fn private_dir(path: &Path) -> Result<()> {
     check_path(path)?;
     if !path.exists() {
@@ -195,8 +206,8 @@ pub(crate) fn configure(
     binary: &Path,
 ) -> Result<Vec<String>> {
     ensure!(
-        cfg!(unix),
-        "session memory hooks currently support macOS and Linux only"
+        cfg!(all(unix, not(target_os = "trueos"))),
+        "Claude Code session hooks require Unix process execution and owner-only private directories; unavailable on this target"
     );
     let project = project.canonicalize()?;
     loopback(url)?;
@@ -577,6 +588,18 @@ pub(crate) fn run(args: &[String]) -> i32 {
     0
 }
 
+#[cfg(target_os = "trueos")]
+fn autoindex(_config: &Config, _directory: &Path, _lease: &File) -> Result<()> {
+    // Native std subprocess execution and lock-lease inheritance are not
+    // available. A nonblocking child stop does not preserve this lease after
+    // supervisor exit, so fail before staging files or spawning a writer.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "session hook autoindex requires subprocess execution with an inherited lock lease",
+    ).into())
+}
+
+#[cfg(not(target_os = "trueos"))]
 fn autoindex(config: &Config, directory: &Path, lease: &File) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(60);
     for dry in [true, false] {

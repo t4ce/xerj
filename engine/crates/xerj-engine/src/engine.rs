@@ -5614,6 +5614,7 @@ fn validate_snapshot_path(
 /// What is inside it is still checked per request: the caller canonicalizes the
 /// repo location, so `packs/x -> /etc` resolves outside this root and is
 /// refused, and `..` components are rejected before this is consulted.
+#[cfg(not(target_os = "trueos"))]
 fn trusted_hub_pack_root(packs: &std::path::Path) -> Option<std::path::PathBuf> {
     if !packs.is_absolute() {
         return None;
@@ -5636,6 +5637,13 @@ fn trusted_hub_pack_root(packs: &std::path::Path) -> Option<std::path::PathBuf> 
         return None;
     }
     Some(canon)
+}
+
+#[cfg(target_os = "trueos")]
+fn trusted_hub_pack_root(_packs: &std::path::Path) -> Option<std::path::PathBuf> {
+    // An environment-derived directory is not an ownership proof. Native
+    // callers must use the operator's explicit snapshot repository allowlist.
+    None
 }
 
 /// Recursively copy all files from `src` to `dst`, recording relative paths in `files`.

@@ -110,6 +110,8 @@ mod batch;
 mod batch_cli;
 mod def;
 mod hub;
+#[cfg(any(target_os = "trueos", test))]
+mod local_service;
 mod map;
 #[cfg(any(target_os = "trueos", test))]
 mod native_stdio;
@@ -176,6 +178,9 @@ OPTIONS:
                     Overrides XERJ_URL. Default: http://localhost:9200
     --auth <VALUE>  Authorization header sent verbatim on every proxied
                     request (e.g. 'ApiKey <token>'). Overrides XERJ_AUTH.
+    --ensure-local TRUEOS only: start the installed xerj-service Blueprint
+                    when needed and wait for authenticated local readiness.
+                    Requires http://127.0.0.1:9200 (localhost also accepted).
     -h, --help      Show this help
     -V, --version   Print version and exit
     --disable-feedback
@@ -335,6 +340,7 @@ fn resolve_auth(
 pub async fn run(args: &[String]) -> anyhow::Result<()> {
     let mut url_override: Option<String> = None;
     let mut auth_override: Option<String> = None;
+    let mut ensure_local = false;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -366,6 +372,7 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
                         .clone(),
                 );
             }
+            "--ensure-local" => ensure_local = true,
             other => {
                 // Fail loudly: a typo'd flag that is silently ignored leaves the
                 // agent talking to the wrong node with no way to notice.
@@ -380,8 +387,31 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
         .unwrap_or_else(|| DEFAULT_XERJ_URL.to_string())
         .trim_end_matches('/')
         .to_string();
-    let (auth, auth_key_file) =
-        resolve_auth(auth_override, std::env::var("XERJ_AUTH").ok(), &base_url);
+    let env_auth = std::env::var("XERJ_AUTH").ok();
+    let (auth, auth_key_file) = if ensure_local {
+        #[cfg(not(target_os = "trueos"))]
+        anyhow::bail!(
+            "--ensure-local requires TRUEOS; start the node separately and omit this flag"
+        );
+        #[cfg(target_os = "trueos")]
+        {
+            let explicit_auth = auth_override
+                .filter(|value| !value.is_empty())
+                .or_else(|| env_auth.filter(|value| !value.is_empty()));
+            let auth = local_service::ensure(&base_url, explicit_auth.as_deref()).await?;
+            (Some(auth), None)
+        }
+    } else {
+        resolve_auth(auth_override, env_auth, &base_url)
+    };
+    // Keep subsequent tool requests on the same literal loopback origin that
+    // readiness authenticated, including when the caller supplied localhost.
+    #[cfg(target_os = "trueos")]
+    let base_url = if ensure_local {
+        local_service::ENDPOINT.to_string()
+    } else {
+        base_url
+    };
 
     let client = node_http_builder(&base_url)
         .timeout(REQUEST_TIMEOUT)

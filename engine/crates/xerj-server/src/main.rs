@@ -1372,6 +1372,7 @@ fn init_tracing(logging: &xerj_common::config::LoggingConfig) {
 // Graceful shutdown
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(not(target_os = "trueos"))]
 async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -1398,6 +1399,13 @@ async fn shutdown_signal() {
         _ = ctrl_c  => { SHUTDOWN_LOGGED.call_once(|| info!("SIGINT received — shutting down")); }
         _ = sigterm => { SHUTDOWN_LOGGED.call_once(|| info!("SIGTERM received — shutting down")); }
     }
+}
+
+#[cfg(target_os = "trueos")]
+async fn shutdown_signal() {
+    // Native service Hulls have an owner-controlled lifetime. Unix signal
+    // registration is unsupported; it must not panic the serving runtime.
+    std::future::pending::<()>().await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2756,7 +2764,7 @@ fn raise_nofile_limit() {
 /// vanished stdout either: the next log line terminates it. Supervised
 /// deployments point stdout at a file or `/dev/null` (`brain`'s boot path
 /// included), so in practice this only reaches `xerj | reader-that-leaves`.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn restore_default_sigpipe() {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
@@ -2859,7 +2867,11 @@ mod fatal_reporter_tests {
 /// `{data_dir}/crash.log`, opened once the data directory exists. `-1`
 /// until then. Fatal signal and allocation-failure hooks write this fd
 /// with `write(2)` and never allocate.
+#[cfg(not(target_os = "trueos"))]
 static CRASH_LOG_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(target_os = "trueos")]
+static NATIVE_CRASH_LOG: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
 
 fn append_bytes(out: &mut [u8], mut at: usize, bytes: &[u8]) -> usize {
     for &b in bytes {
@@ -2920,7 +2932,7 @@ fn format_fatal_signal(out: &mut [u8], sig: i32) -> usize {
     at
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn write_fd(fd: i32, bytes: &[u8]) {
     if fd < 0 || bytes.is_empty() {
         return;
@@ -2941,7 +2953,7 @@ fn write_fd(fd: i32, bytes: &[u8]) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn report_fatal(bytes: &[u8]) {
     write_fd(libc::STDERR_FILENO, bytes);
     let fd = CRASH_LOG_FD.load(std::sync::atomic::Ordering::Relaxed);
@@ -2950,7 +2962,7 @@ fn report_fatal(bytes: &[u8]) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(any(target_os = "trueos", not(unix)))]
 fn report_fatal(bytes: &[u8]) {
     let _ = std::io::Write::write_all(&mut std::io::stderr(), bytes);
 }
@@ -2965,10 +2977,10 @@ fn note_alloc_failure(size: usize, align: usize) {
 /// The disposition each fatal signal had before [`install_fatal_reporter`]
 /// replaced it. Written once at startup, before the handler can run, and
 /// only read inside the handler.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 static mut PREVIOUS_FATAL_ACTIONS: [Option<libc::sigaction>; 4] = [None; 4];
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 const FATAL_SIGNALS: [libc::c_int; 4] = [libc::SIGABRT, libc::SIGSEGV, libc::SIGBUS, libc::SIGILL];
 
 /// Async-signal-safe. Writes a line, puts back the disposition the signal
@@ -2978,7 +2990,7 @@ const FATAL_SIGNALS: [libc::c_int; 4] = [libc::SIGABRT, libc::SIGSEGV, libc::SIG
 /// `siginfo`; `abort()` re-raises SIGABRT after a handler returns; so the
 /// process still dies with the original signal. SIGKILL cannot be caught.
 /// SIGTERM is left to the server's shutdown path.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 extern "C" fn fatal_signal(sig: libc::c_int) {
     let mut buf = [0u8; 128];
     let n = format_fatal_signal(&mut buf, sig);
@@ -3009,7 +3021,7 @@ fn install_fatal_reporter() {
     // the abort or exit that does.
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "trueos")))]
         {
             let fd = CRASH_LOG_FD.load(std::sync::atomic::Ordering::Relaxed);
             if fd >= 0 {
@@ -3021,15 +3033,23 @@ fn install_fatal_reporter() {
                 write_fd(fd, line.as_bytes());
             }
         }
+        #[cfg(target_os = "trueos")]
+        {
+            use std::io::Write;
+            if let Ok(mut log) = NATIVE_CRASH_LOG.try_lock() {
+                if let Some(file) = log.as_mut() {
+                    let thread = std::thread::current();
+                    let _ = writeln!(file, "xerj panicked on thread {}: {info}",
+                        thread.name().unwrap_or("<unnamed>"));
+                }
+            }
+        }
         previous(info);
     }));
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "trueos")))]
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = fatal_signal as *const () as libc::sighandler_t;
-        // TRUEOS uses the zeroed mask as the empty set and does not expose
-        // sigemptyset. Other Unix targets retain their libc initializer.
-        #[cfg(not(target_os = "trueos"))]
         libc::sigemptyset(&mut action.sa_mask);
         // SA_ONSTACK: a stack overflow faults with no stack left, so the
         // handler must run on the alternate stack the Rust runtime sets up
@@ -3049,7 +3069,7 @@ fn install_fatal_reporter() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn open_crash_log(data_dir: &Path) {
     let path = data_dir.join("crash.log");
     let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
@@ -3067,6 +3087,17 @@ fn open_crash_log(data_dir: &Path) {
     }
 }
 
+#[cfg(target_os = "trueos")]
+fn open_crash_log(data_dir: &Path) {
+    let file = std::fs::File::options()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("crash.log"));
+    if let (Ok(file), Ok(mut log)) = (file, NATIVE_CRASH_LOG.lock()) {
+        *log = Some(file);
+    }
+}
+
 #[cfg(not(unix))]
 fn open_crash_log(_data_dir: &Path) {}
 
@@ -3076,7 +3107,7 @@ fn main() -> Result<()> {
     // allocation hook, the panic hook, and SIGABRT/SIGSEGV/SIGBUS/SIGILL
     // each write a FATAL line. SIGKILL still cannot be reported.
     install_fatal_reporter();
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "trueos")))]
     restore_default_sigpipe();
 
     // TRUEOS supplies its descriptor capacity through the native registries;

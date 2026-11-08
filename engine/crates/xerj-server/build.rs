@@ -11,14 +11,16 @@
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let proto_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("proto");
+    // Native Blueprint builds stage this package away from its workspace.
+    // The SDK resolves build-env-paths against the original source manifest.
+    let proto_root = std::env::var_os("XERJ_PROTO_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../proto"));
     let proto_file = proto_root.join("xerj.proto");
 
     println!("cargo:rerun-if-changed={}", proto_file.display());
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=XERJ_PROTO_ROOT");
 
     // Pure-Rust parse → FileDescriptorSet (no `protoc` process spawned).
     let file_descriptors = protox::compile([&proto_file], [&proto_root])?;

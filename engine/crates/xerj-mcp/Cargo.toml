@@ -66,7 +66,11 @@ xerj-hub = { path = "../xerj-hub" }
 # this crate only exposes them. No cycle: autoindex does not depend on mcp.
 xerj-autoindex = { path = "../xerj-autoindex" }
 
+[target.'cfg(target_os = "trueos")'.dependencies]
+trueos = { path = "../../../../TRUEOS-Blueprints/api", default-features = false, features = ["native-c-alloc"] }
+
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 # The loopback admin-key fallback tests sandbox cwd + HOME so discovery sees
 # only the key files the test wrote (same pattern as xerj-autoindex's cli
 # tests, where the helper was born).

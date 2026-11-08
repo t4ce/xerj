@@ -895,7 +895,7 @@ fn unfinished_without_index_lock(target: &Path, index: &Path) -> Option<Unfinish
 /// in a checkout that never finished belongs to an attempt that is over. A lock
 /// in a checkout that did finish is left alone: a git the operator is running
 /// there may own it, and removing it would let two gits write one index.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn stale_index_lock(target: &Path) -> Option<PathBuf> {
     let index = checkout_index_path(target).ok()?;
     let lock = index.with_file_name("index.lock");
@@ -1037,18 +1037,29 @@ thread_local! {
 struct GitLockHandoff;
 
 impl GitLockHandoff {
-    #[cfg(unix)]
-    fn new(lock: &std::fs::File) -> Self {
+    #[cfg(all(unix, not(target_os = "trueos")))]
+    fn new(lock: &std::fs::File) -> std::io::Result<Self> {
         use std::os::unix::io::AsRawFd;
         GIT_LOCK_FD.with(|fd| fd.set(lock.as_raw_fd()));
-        Self
+        Ok(Self)
+    }
+
+    #[cfg(target_os = "trueos")]
+    fn new(_lock: &std::fs::File) -> std::io::Result<Self> {
+        // Native subprocesses expose no inheritable file-lock lease. Owner
+        // cleanup is asynchronous, so a parent lock alone cannot prove that
+        // every Git writer has stopped before another run takes the corpus.
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native Git corpus cloning requires an inheritable file-lock lease",
+        ))
     }
 
     /// Windows has no `FD_CLOEXEC` to clear and no `flock` to inherit, so a
     /// killed `xerj` still leaves its git unaccounted for there.
     #[cfg(not(unix))]
-    fn new(_lock: &std::fs::File) -> Self {
-        Self
+    fn new(_lock: &std::fs::File) -> std::io::Result<Self> {
+        Ok(Self)
     }
 }
 
@@ -1058,7 +1069,7 @@ impl Drop for GitLockHandoff {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn inherit_corpus_lock(c: &mut Command) {
     use std::os::unix::process::CommandExt;
     let fd = GIT_LOCK_FD.with(|fd| fd.get());
@@ -1084,7 +1095,7 @@ fn inherit_corpus_lock(c: &mut Command) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(any(target_os = "trueos", not(unix)))]
 fn inherit_corpus_lock(_c: &mut Command) {}
 
 fn dir_stats(target: &Path) -> (String, u64, u64) {
@@ -1562,7 +1573,13 @@ fn run_corpus_add(args: &[String]) -> i32 {
     };
     // The git operations that outlive a killed `xerj` inherit the lock, so
     // one still writing into a folder the next run reuses is noticed (#2520).
-    let _handoff = GitLockHandoff::new(&_lock);
+    let _handoff = match GitLockHandoff::new(&_lock) {
+        Ok(handoff) => handoff,
+        Err(error) => {
+            eprintln!("xerj corpus add: {error}");
+            return 1;
+        }
+    };
     // A corpus name is EITHER a cloned-repo corpus or a harvested one.
     // Cloning repos into a harvested corpus's dir would corrupt both views:
     // the manifest's pseudo-repos would sit beside real clones, and
@@ -1652,7 +1669,7 @@ fn run_corpus_add(args: &[String]) -> i32 {
             continue;
         }
         if target.join(".git").exists() {
-            #[cfg(unix)]
+            #[cfg(all(unix, not(target_os = "trueos")))]
             if let Some(lock) = stale_index_lock(&target) {
                 if std::fs::remove_file(&lock).is_ok() {
                     println!(
@@ -6102,7 +6119,7 @@ precedence = ["a", "b"]
     fn a_git_started_by_corpus_add_keeps_the_corpus_lock() {
         let home = tempfile::tempdir().unwrap();
         let lock = lock_corpus_add(home.path(), "held").unwrap();
-        let handoff = GitLockHandoff::new(&lock);
+        let handoff = GitLockHandoff::new(&lock).unwrap();
         // `hash-object --stdin` blocks until its stdin closes, which this test
         // never does, so a real git holds the lock until it is killed. The
         // handoff adds `-c core.fsmonitor=false`, a global option, so it goes
@@ -6151,7 +6168,7 @@ precedence = ["a", "b"]
     fn a_git_started_by_corpus_add_disables_fsmonitor() {
         let home = tempfile::tempdir().unwrap();
         let lock = lock_corpus_add(home.path(), "fm").unwrap();
-        let handoff = GitLockHandoff::new(&lock);
+        let handoff = GitLockHandoff::new(&lock).unwrap();
         let mut c = Command::new("git");
         inherit_corpus_lock(&mut c);
         let args: Vec<_> = c

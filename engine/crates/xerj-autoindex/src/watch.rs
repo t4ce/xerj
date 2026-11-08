@@ -118,6 +118,8 @@ struct Fingerprint {
     size: u64,
     mtime_ns: i128,
     ino: u64,
+    #[cfg(target_os = "trueos")]
+    root: u32,
 }
 
 fn fingerprint_of(path: &Path) -> Option<Fingerprint> {
@@ -131,11 +133,13 @@ fn fingerprint_of(path: &Path) -> Option<Fingerprint> {
             // honest answer, and equality is all this value is ever used for.
             Err(e) => -(e.duration().as_nanos() as i128),
         })?;
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "trueos")))]
     let ino = {
         use std::os::unix::fs::MetadataExt;
         md.ino()
     };
+    #[cfg(target_os = "trueos")]
+    let ino = md.file_id()?;
     // Windows has a file index, but reading it needs a handle open with
     // FILE_FLAG_BACKUP_SEMANTICS; size+mtime plus the event set is what the
     // fingerprint is there, and a rename dance changes the mtime.
@@ -145,6 +149,8 @@ fn fingerprint_of(path: &Path) -> Option<Fingerprint> {
         size: md.len(),
         mtime_ns,
         ino,
+        #[cfg(target_os = "trueos")]
+        root: md.root_id(),
     })
 }
 

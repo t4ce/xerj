@@ -64,7 +64,7 @@ For example, an existing SDK parent Blueprint can call
 {
   "program": "xerj",
   "args": [
-    "--insecure", "--bind", "127.0.0.1", "--port", "9200",
+    "--bind", "127.0.0.1", "--port", "9200", "--no-auto-port",
     "--data-dir", "/apps/xerj/data", "--disable-feedback"
   ],
   "env": {
@@ -81,7 +81,7 @@ observe `child_hull::status`. The logical program `xerj` resolves `xerj.bp` in
 AppDB. The data directory must remain outside every source tree being indexed.
 The pool sizes above are optional runtime tuning; they do not remove features.
 
-This local trial uses cleartext loopback with authentication disabled. The
+This launch uses cleartext loopback with authentication enabled. The
 explicit base port selects ES-compatible HTTP on 9200, native REST on 9201 and
 gRPC on 9202. Check `GET http://127.0.0.1:9200/` from the client Hull before
 using MCP; listening successfully in the server Hull alone does not establish
@@ -95,22 +95,42 @@ launch-script command as argv and does not discover an arbitrary config file.
 
 ## Connect Codex over MCP
 
-After the native engine answers from Codex's Hull, add this to Codex's config:
+Install the complete Codex appbundle, including `xerj-service.bp` and its
+`xerj.bp` dependency. The native Codex package supplies this ordinary MCP
+configuration by default; user configuration can override it:
 
 ```toml
 [mcp_servers.xerj]
 command = "xerj"
-args = ["mcp", "--url", "http://127.0.0.1:9200"]
-cwd = "/apps/xerj"
+args = ["mcp", "--ensure-local"]
+startup_timeout_sec = 120
+required = false
 
 [mcp_servers.xerj.env]
+XERJ_URL = "http://127.0.0.1:9200"
 XERJ_DISABLE_FEEDBACK = "true"
 ```
 
 Codex resolves the command through AppDB and starts a fresh instance with stdin,
 stdout, argv and environment. The `mcp` path dispatches before startup banners:
 stdout carries only newline-delimited JSON-RPC, while diagnostics use stderr.
-Keep the server process separate; `xerj mcp` connects to an existing engine.
+`--ensure-local` starts the installed `xerj-service` archive headlessly through
+the generic launch API, independently of the MCP proxy. The launcher holds an
+exclusive lock before spawning its engine, so simultaneous Codex sessions
+share one engine. Closing a proxy leaves the engine available for other
+clients; stopping the service Hull stops its child. Reopening an MCP session
+can start the service again, preserving `/apps/xerj/data`.
+
+Activation has a 90-second deadline. It requires the local endpoint to reject
+an unauthenticated request, then accept the configured key and return a XERJ
+identity. It refuses an open node, a bad credential or another endpoint; it
+never passes `--insecure`. The returned credential is also used for subsequent
+MCP tool requests. Diagnostics go to stderr and contain no credential.
+
+Default `xerj mcp` remains a proxy to an existing node on every platform. For
+a remote node or another local port omit `--ensure-local` and set `XERJ_URL`
+and `XERJ_AUTH` normally. The opt-in flag rejects those endpoints before launch;
+outside TRUEOS it returns an unsupported-platform error.
 For the optional standalone package use `command = "xerj-mcp"` and remove
 `"mcp"` from `args`.
 
@@ -119,24 +139,34 @@ Tokio tasks forward reads and writes to the original Hull entry thread, where
 the child transport ABI is callable; an empty live stream waits for more data
 instead of being treated as EOF. Both MCP entrypoints install this broker.
 
-The configured working directory lets the loopback client's existing key
-discovery find `/apps/xerj/data/admin.key` for a default node. For a node with a
+The native activation path reads `/apps/xerj/data/admin.key` directly, so first
+run does not require a pre-existing working directory. For a node with a
 different data directory, pass `XERJ_AUTH = "ApiKey <key>"` in the MCP env block.
 The node's key is stored in `<data-dir>/admin.key`; use the startup banner's
 resolved data path when configuring another instance.
+
+Native Git corpus cloning and Claude Code Unix hook setup return an explicit
+unsupported error before changing corpus content or hook files. The native
+subprocess and filesystem APIs do not yet supply the inheritable lock leases
+and private Unix directory guarantees these operations require. Direct MCP
+agent memory and local-file indexing use their existing HTTP and native file
+paths.
 
 ## Exercise the package
 
 Build the finite native integration probe from the SDK with
 `cargo bp probes/xerj_smoke`, then install and launch `xerj-smoke`. It creates
-fresh test data and checks HTTP, gRPC Health, local Rust/Markdown autoindex,
-MCP source-line retrieval, memory and persistence after restart. Success ends
+fresh test data and checks HTTP, gRPC Health, local Rust/Markdown/SQLite autoindex,
+MCP source-line and exact SQLite-row retrieval through actual native Codex, single-Codex admission,
+packaged-default MCP service activation, memory and persistence after restart. Success ends
 with `xerj-smoke v=1 stage=end ok=true`; a compiled probe alone establishes
-none of those runtime results. The probe stops all of its engine/MCP children.
+none of those runtime results. The probe stops its fixture engine/MCP/Codex
+children; the independent normal XERJ service remains running.
 
-The probe also checks RNG, P256/SHA256 signing and tamper rejection, a fixed
+The separate opt-in `openssl-check` feature checks RNG, P256/SHA256 signing and tamper rejection, a fixed
 SHA256 digest and UTC formatting on two native threads and the entry thread.
-It has been packaged; native execution has not yet been verified. Host tests
+It is off by default and requires a native OpenSSL provider update after the
+Unix ABI removal; native execution has not been verified. Historical host tests
 have passed against the native-configured OpenSSL archives, including RNG
 failure with CPU entropy masked, plus 155,949 utility regression checks.
 Those host results do not establish native passkey or engine behavior.

@@ -431,11 +431,21 @@ fn parse_pid(text: &str) -> Option<u32> {
 }
 
 fn path_names_this_file(file: &File, path: &Path) -> bool {
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "trueos")))]
     {
         use std::os::unix::fs::MetadataExt;
         match (file.metadata(), fs::metadata(path)) {
             (Ok(ours), Ok(named)) => ours.dev() == named.dev() && ours.ino() == named.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(target_os = "trueos")]
+    {
+        match (file.metadata(), fs::metadata(path)) {
+            (Ok(ours), Ok(named)) => {
+                ours.root_id() == named.root_id()
+                    && ours.file_id().is_some_and(|id| Some(id) == named.file_id())
+            }
             _ => false,
         }
     }

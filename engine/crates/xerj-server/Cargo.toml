@@ -14,6 +14,10 @@ entry-abi = "argv-v1"
 fs-scope = "trueosfs"
 rewrite-std-imports = false
 
+[package.metadata.trueos-blueprint.build-env-paths]
+# The SDK compiles from a staged package directory; keep the real proto source.
+XERJ_PROTO_ROOT = "../../proto"
+
 [[bin]]
 name = "xerj"
 path = "src/main.rs"
@@ -115,7 +119,7 @@ tikv-jemalloc-sys = "0.6"
 libc = "0.2"
 
 [target.'cfg(target_os = "trueos")'.dependencies]
-trueos = { path = "../../../../TRUEOS-Blueprints/api", default-features = false }
+trueos = { path = "../../../../TRUEOS-Blueprints/api", default-features = false, features = ["native-c-alloc"] }
 # Tower 0.4 uses IndexMap's std default hasher. Its old build-script probe
 # cannot discover Cargo's separately built native std, so request it directly.
 indexmap_legacy = { package = "indexmap", version = "1.9.3", features = ["std"] }

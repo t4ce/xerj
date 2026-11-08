@@ -162,11 +162,22 @@ fn unchanged(file: &File, before: &Metadata, input: &Path, read: u64) -> Result<
             && before.modified()? == named.modified()?,
         "session input changed during import; use a stopped or archived transcript"
     );
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "trueos")))]
     {
         use std::os::unix::fs::MetadataExt;
         ensure!(
             before.dev() == named.dev() && before.ino() == named.ino(),
+            "session input was replaced during import; use an archived transcript"
+        );
+    }
+    #[cfg(target_os = "trueos")]
+    {
+        let identity = before.file_id().context("session input has no native record identity")?;
+        ensure!(
+            after.file_id() == Some(identity)
+                && named.file_id() == Some(identity)
+                && before.root_id() == after.root_id()
+                && before.root_id() == named.root_id(),
             "session input was replaced during import; use an archived transcript"
         );
     }

@@ -507,11 +507,22 @@ fn files_equal(a: &Path, b: &Path) -> Result<bool> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn same_file_identity(a: &Path, b: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     match (std::fs::metadata(a), std::fs::metadata(b)) {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "trueos")]
+fn same_file_identity(a: &Path, b: &Path) -> bool {
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => {
+            a.root_id() == b.root_id()
+                && a.file_id().is_some_and(|id| Some(id) == b.file_id())
+        }
         _ => false,
     }
 }
