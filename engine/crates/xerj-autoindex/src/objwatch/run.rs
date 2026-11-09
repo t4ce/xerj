@@ -32,11 +32,13 @@ use crate::cli::WatchCfg;
 /// holding, saves, and returns.
 static STOP: AtomicBool = AtomicBool::new(false);
 
+#[cfg(not(target_os = "trueos"))]
 extern "C" fn on_signal(_sig: libc::c_int) {
     // Async-signal-safe: one relaxed atomic store, nothing else.
     STOP.store(true, Ordering::SeqCst);
 }
 
+#[cfg(not(target_os = "trueos"))]
 fn install_signal_handlers() {
     // SAFETY: `on_signal` does one atomic store and returns, which is
     // async-signal-safe. Installing a handler for SIGINT/SIGTERM is the whole
@@ -45,6 +47,16 @@ fn install_signal_handlers() {
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
     }
+}
+
+#[cfg(target_os = "trueos")]
+fn install_signal_handlers() {
+    // Hull termination controls native lifetime; no POSIX signal registration
+    // exists. Bounded watch runs still finish and save their journal normally.
+    eprintln!(
+        "xerj-watch: native Hull lifetime uses owner termination; Unix signals are unavailable. \
+         Use --max-cycles for a bounded run with normal journal completion."
+    );
 }
 
 /// `r2://bucket/prefix` is a spelling of `s3://bucket/prefix`: Cloudflare R2

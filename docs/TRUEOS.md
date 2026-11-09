@@ -28,11 +28,13 @@ Experimental ONNX and diagnostic profiling are outside those upstream defaults.
 
 Console/passkey support builds the pinned OpenSSL source through the SDK's
 native overlay. This requires Perl, make and the SDK's x86_64 C/assembler
-toolchain. Keep the upstream x86 assembly enabled: the native configuration
-uses OpenSSL's `rdcpu` entropy source, which requires working, CPUID-advertised
-RDSEED or RDRAND instructions on the target CPU. Missing or failed hardware
-entropy makes RNG-dependent operations return errors; there is no fallback to
-time, random-device files or the void `sys_rand` interface.
+toolchain. Install GNU binutils with `ld.bfd` or GNU `ld`: the SDK uses its
+relocatable link support to allocate retained ELF COMMON storage before
+packaging. Upstream x86 assembly stays enabled. The native entropy provider
+uses the kernel's fallible random-byte interface, including on native worker
+threads. An entropy failure makes RNG-dependent operations return errors;
+there is no fallback to time, random-device files or the void `sys_rand`
+interface.
 
 ## Start the native engine
 
@@ -61,6 +63,12 @@ authentication and data-directory defaults. TRUEOS defaults to one to four
 Tokio workers according to available cores, with four to eight additional
 blocking threads admitted on demand. Worker stacks retain the upstream 4 MiB
 size. `TOKIO_WORKER_THREADS` can override the native worker default.
+
+The native filesystem API does not expose total or available capacity. Disk
+telemetry therefore reports unavailable, and the upstream disk-watermark path
+does not block ingestion from that missing sample. The memory governor still
+enforces tracked memtable byte budgets; native disk fullness is reported by
+actual filesystem I/O failures.
 
 Shell3 recognizes exact app names and does not provide general argv. Use
 a process-shaped launcher when supplying flags or environment.
@@ -158,6 +166,12 @@ subprocess and filesystem APIs do not yet supply the inheritable lock leases
 and private Unix directory guarantees these operations require. Direct MCP
 agent memory and local-file indexing use their existing HTTP and native file
 paths.
+
+Native object watches retain polling and journal updates, but use owner Hull
+termination rather than Unix signal handlers. Use `--max-cycles` for bounded
+runs that finish normally; abrupt owner termination does not establish a final
+journal flush. Process CPU-time telemetry reports unavailable on TRUEOS rather
+than substituting wall time.
 
 ## Exercise the package
 

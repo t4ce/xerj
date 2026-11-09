@@ -108,9 +108,12 @@ async fn probe(
     let url = format!("{endpoint}/_security/_authenticate");
     let response = match client.get(&url).send().await {
         Ok(response) => response,
-        Err(error) if error.is_connect() => return Ok(None),
+        Err(error) if error.is_connect() || error.is_timeout() => return Ok(None),
         Err(_) => anyhow::bail!("local XERJ readiness request failed; inspect xerj-service output"),
     };
+    if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return starting_response(response).await;
+    }
     anyhow::ensure!(
         response.status() == reqwest::StatusCode::UNAUTHORIZED,
         "local XERJ endpoint does not require authentication; --ensure-local refuses it"
@@ -120,16 +123,33 @@ async fn probe(
         Some(auth) => auth.to_string(),
         None => read_auth()?,
     };
-    let mut response = client
+    let response = match client
         .get(url)
         .header(reqwest::header::AUTHORIZATION, &auth)
         .send()
         .await
-        .map_err(|_| anyhow::anyhow!("local XERJ authenticated readiness request failed"))?;
+    {
+        Ok(response) => response,
+        Err(error) if error.is_connect() || error.is_timeout() => return Ok(None),
+        Err(_) => anyhow::bail!("local XERJ authenticated readiness request failed"),
+    };
+    if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return starting_response(response).await;
+    }
     anyhow::ensure!(
         response.status().is_success(),
         "local XERJ did not accept its configured credential; inspect xerj-service and the admin key"
     );
+    let body = read_response(response).await?;
+    let identity: serde_json::Value = serde_json::from_slice(&body)?;
+    anyhow::ensure!(
+        identity["username"] == "xerj" && identity["enabled"] == true,
+        "local endpoint did not return an authenticated XERJ identity"
+    );
+    Ok(Some(auth))
+}
+
+async fn read_response(mut response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         anyhow::ensure!(
@@ -138,12 +158,20 @@ async fn probe(
         );
         body.extend_from_slice(&chunk);
     }
-    let identity: serde_json::Value = serde_json::from_slice(&body)?;
+    Ok(body)
+}
+
+async fn starting_response(response: reqwest::Response) -> anyhow::Result<Option<String>> {
+    let body = read_response(response).await?;
+    let response: serde_json::Value = serde_json::from_slice(&body)?;
     anyhow::ensure!(
-        identity["username"] == "xerj" && identity["enabled"] == true,
-        "local endpoint did not return an authenticated XERJ identity"
+        response
+            .pointer("/error/type")
+            .and_then(|value| value.as_str())
+            == Some("node_starting_exception"),
+        "local endpoint returned an unexpected unavailable response"
     );
-    Ok(Some(auth))
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -300,5 +328,73 @@ mod tests {
             }
             server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn starting_node_retries_without_reading_a_key_then_requires_authentication() {
+        use axum::{Router, extract::State, http::HeaderMap, routing::get};
+        use std::sync::Arc;
+        async fn authenticate(
+            State(calls): State<Arc<AtomicUsize>>,
+            headers: HeaderMap,
+        ) -> (reqwest::StatusCode, axum::Json<serde_json::Value>) {
+            match calls.fetch_add(1, Ordering::SeqCst) {
+                0 => (
+                    reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(serde_json::json!({"error":{"type":"node_starting_exception"}})),
+                ),
+                1 => (
+                    reqwest::StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::Value::Null),
+                ),
+                2 if headers
+                    .get("authorization")
+                    .is_some_and(|v| v == "ApiKey fixture") =>
+                {
+                    (
+                        reqwest::StatusCode::OK,
+                        axum::Json(serde_json::json!({"username":"xerj","enabled":true})),
+                    )
+                }
+                _ => (
+                    reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(serde_json::json!({"error":{"type":"another_service"}})),
+                ),
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let router = Router::new()
+            .route("/_security/_authenticate", get(authenticate))
+            .with_state(Arc::new(AtomicUsize::new(0)));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(PROBE_TIMEOUT)
+            .build()
+            .unwrap();
+        assert!(
+            probe(&client, &endpoint, None, || panic!(
+                "starting node needs no key"
+            ))
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            probe(&client, &endpoint, None, || Ok("ApiKey fixture".into()))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ApiKey fixture")
+        );
+        assert!(
+            probe(&client, &endpoint, None, || panic!(
+                "foreign node needs no key"
+            ))
+            .await
+            .is_err()
+        );
+        server.abort();
     }
 }

@@ -213,7 +213,7 @@ fn send_snapshot(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "trueos")))]
 fn process_cpu_time_ns() -> Option<u64> {
     let mut time = libc::timespec {
         tv_sec: 0,
@@ -229,8 +229,10 @@ fn process_cpu_time_ns() -> Option<u64> {
     seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
 }
 
-#[cfg(not(unix))]
+#[cfg(any(not(unix), target_os = "trueos"))]
 fn process_cpu_time_ns() -> Option<u64> {
+    // Native clocks provide wall/monotonic time, not process CPU accounting.
+    // Keep unavailable telemetry explicit rather than substituting elapsed time.
     None
 }
 

@@ -2554,8 +2554,8 @@ fn cgroup_memory_limit_bytes() -> Option<u64> {
 
 /// `(total_bytes, avail_bytes)` for the filesystem backing `path`, via
 /// `statvfs(2)` on Unix or `GetDiskFreeSpaceExW` on Windows.
-/// Returns `None` on syscall failure.
-#[cfg(unix)]
+/// Returns `None` on failure or when the platform has no capacity-query API.
+#[cfg(all(unix, not(target_os = "trueos")))]
 #[allow(clippy::unnecessary_cast)]
 pub fn disk_stats(path: &str) -> Option<(u64, u64)> {
     let c = std::ffi::CString::new(path).ok()?;
@@ -2632,7 +2632,9 @@ pub fn disk_stats(path: &str) -> Option<(u64, u64)> {
     }
 }
 
-#[cfg(not(any(unix, target_os = "windows")))]
+// Native TRUEOSFS has no filesystem-capacity query in its Blueprint API.
+// Unavailable telemetry must remain None rather than a fabricated measurement.
+#[cfg(any(target_os = "trueos", not(any(unix, target_os = "windows"))))]
 pub fn disk_stats(_path: &str) -> Option<(u64, u64)> {
     None
 }
@@ -3763,7 +3765,7 @@ mod tests {
 
     #[test]
     fn this_machine_disk_stats_are_sane() {
-        if cfg!(any(unix, target_os = "windows")) {
+        if cfg!(any(all(unix, not(target_os = "trueos")), target_os = "windows")) {
             let (total, avail) =
                 disk_stats(".").expect("disk_stats must succeed on the current directory");
             assert!(total > 0, "total disk space must be positive");
@@ -3771,6 +3773,28 @@ mod tests {
             let pct = disk_used_pct(".");
             assert!(pct <= 100, "disk used percentage must be <= 100");
         }
+    }
+
+    #[test]
+    #[cfg(any(unix, target_os = "trueos"))]
+    fn unavailable_disk_telemetry_keeps_memory_budget_enforcement() {
+        // NUL is not a Unix filesystem path; native TRUEOS has no capacity
+        // query. Both cases use the same unavailable contract.
+        assert_eq!(disk_stats("\0"), None);
+        let (used_pct, available) = disk_used_pct_and_avail("\0");
+        assert_eq!((used_pct, available), (0, 0));
+        let mut cfg = Config::default();
+        cfg.limits.max_total_memtable_mb = 100;
+        cfg.limits.memory_watermark_percent = 0;
+        let g = build(&cfg);
+        g.refresh(200 * MB, 0, used_pct);
+        assert!(matches!(
+            g.check_ingest_admission(),
+            Err(XerjError::CircuitBreaking { .. })
+        ));
+        assert!(g.check_disk_block("i").is_ok());
+        g.refresh(10 * MB, 0, used_pct);
+        assert!(g.check_ingest_admission().is_ok());
     }
 
     #[test]
