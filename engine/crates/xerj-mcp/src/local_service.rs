@@ -1,4 +1,5 @@
-//! Opt-in native service activation. Default MCP startup remains a pure proxy.
+//! Opt-in native service activation: eager `--ensure-local` or first-tool
+//! `--lazy-local`. Without either flag MCP remains a pure proxy.
 //!
 //! Uses the same independent headless Blueprint launch boundary as the native
 //! SQLite client (`sqlx-sqlite/src/remote/connection.rs::ensure_service`).
@@ -13,7 +14,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(90);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const RETRY_DELAY: Duration = Duration::from_millis(100);
 
-fn validate_endpoint(endpoint: &str) -> anyhow::Result<()> {
+pub(super) fn validate_endpoint(endpoint: &str) -> anyhow::Result<()> {
     let url = reqwest::Url::parse(endpoint)?;
     anyhow::ensure!(
         url.scheme() == "http"
@@ -24,7 +25,7 @@ fn validate_endpoint(endpoint: &str) -> anyhow::Result<()> {
             && url.path() == "/"
             && url.query().is_none()
             && url.fragment().is_none(),
-        "--ensure-local requires http://127.0.0.1:9200; omit it to use another node"
+        "--ensure-local/--lazy-local require http://127.0.0.1:9200; omit the flag to use another node"
     );
     Ok(())
 }
@@ -182,10 +183,20 @@ mod tests {
     #[cfg(not(target_os = "trueos"))]
     #[tokio::test]
     async fn native_activation_flag_is_explicitly_unsupported_on_hosts() {
-        let error = super::super::run(&["--ensure-local".into()])
+        for flag in ["--ensure-local", "--lazy-local"] {
+            let error = super::super::run(&[flag.into()]).await.unwrap_err();
+            assert!(error
+                .to_string()
+                .contains(&format!("{flag} requires TRUEOS")));
+        }
+    }
+
+    #[tokio::test]
+    async fn local_activation_modes_cannot_be_combined() {
+        let error = super::super::run(&["--ensure-local".into(), "--lazy-local".into()])
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("--ensure-local requires TRUEOS"));
+        assert!(error.to_string().contains("mutually exclusive"));
     }
 
     #[test]
@@ -259,12 +270,10 @@ mod tests {
             || anyhow::bail!("missing installed service"),
         )
         .await;
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("missing installed service")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("missing installed service"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -287,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_requires_a_credential_and_denies_open_nodes() {
-        use axum::{Router, extract::State, http::HeaderMap, routing::get};
+        use axum::{extract::State, http::HeaderMap, routing::get, Router};
         async fn authenticate(
             State(open): State<bool>,
             headers: HeaderMap,
@@ -332,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn starting_node_retries_without_reading_a_key_then_requires_authentication() {
-        use axum::{Router, extract::State, http::HeaderMap, routing::get};
+        use axum::{extract::State, http::HeaderMap, routing::get, Router};
         use std::sync::Arc;
         async fn authenticate(
             State(calls): State<Arc<AtomicUsize>>,
@@ -373,14 +382,12 @@ mod tests {
             .timeout(PROBE_TIMEOUT)
             .build()
             .unwrap();
-        assert!(
-            probe(&client, &endpoint, None, || panic!(
-                "starting node needs no key"
-            ))
-            .await
-            .unwrap()
-            .is_none()
-        );
+        assert!(probe(&client, &endpoint, None, || panic!(
+            "starting node needs no key"
+        ))
+        .await
+        .unwrap()
+        .is_none());
         assert_eq!(
             probe(&client, &endpoint, None, || Ok("ApiKey fixture".into()))
                 .await
@@ -388,13 +395,11 @@ mod tests {
                 .as_deref(),
             Some("ApiKey fixture")
         );
-        assert!(
-            probe(&client, &endpoint, None, || panic!(
-                "foreign node needs no key"
-            ))
-            .await
-            .is_err()
-        );
+        assert!(probe(&client, &endpoint, None, || panic!(
+            "foreign node needs no key"
+        ))
+        .await
+        .is_err());
         server.abort();
     }
 }

@@ -164,6 +164,81 @@ struct Ctx {
     auth: Option<String>,
 }
 
+type ActivationFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>>;
+
+/// One successful activation per MCP connection. Failed or cancelled attempts
+/// remain retryable; the service's own admission lock spans other clients.
+struct LocalActivation {
+    auth: tokio::sync::OnceCell<String>,
+    activate: Box<dyn Fn() -> ActivationFuture + Send + Sync>,
+}
+
+#[cfg(any(target_os = "trueos", test))]
+impl LocalActivation {
+    fn new<F, Fut>(activate: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<String>> + Send + 'static,
+    {
+        Self {
+            auth: tokio::sync::OnceCell::new(),
+            activate: Box::new(move || Box::pin(activate())),
+        }
+    }
+}
+
+struct Session {
+    ctx: Ctx,
+    local: Option<LocalActivation>,
+}
+
+impl Session {
+    async fn handle_message(&self, msg: Value) -> Option<Value> {
+        if let Some(local) = &self.local {
+            if is_node_tool_call(&msg) {
+                let auth = match local.auth.get_or_try_init(|| (local.activate)()).await {
+                    Ok(auth) => auth,
+                    Err(error) => {
+                        return msg.get("id").map(|id| {
+                            rpc_result(
+                                Some(id.clone()),
+                                tool_text(format!("local XERJ activation failed: {error}"), true),
+                            )
+                        });
+                    }
+                };
+                // Every node adapter, including its blocking clients, receives
+                // the same credential that readiness authenticated.
+                let ctx = Ctx {
+                    client: self.ctx.client.clone(),
+                    base_url: self.ctx.base_url.clone(),
+                    auth: Some(auth.clone()),
+                };
+                return handle_message(&ctx, msg).await;
+            }
+        }
+        handle_message(&self.ctx, msg).await
+    }
+}
+
+fn is_node_tool_call(msg: &Value) -> bool {
+    if !is_tool_call(msg) {
+        return false;
+    }
+    let Some(name) = msg.pointer("/params/name").and_then(Value::as_str) else {
+        return false;
+    };
+    // Feedback and hub discovery do not use the node. Hub ask/def can query
+    // it. Unknown tools must not turn a typo into a service launch either.
+    !matches!(
+        name,
+        "xerj_field_report" | "xerj_corpus_feedback" | "xerj_hub_find"
+    ) && tool_specs()
+        .as_array()
+        .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == name))
+}
+
 /// `--help` text for both entry points (`xerj mcp --help` and `xerj-mcp --help`).
 pub const HELP_BODY: &str = "\
 xerj mcp — Model Context Protocol (MCP) stdio server for XERJ
@@ -179,8 +254,11 @@ OPTIONS:
     --auth <VALUE>  Authorization header sent verbatim on every proxied
                     request (e.g. 'ApiKey <token>'). Overrides XERJ_AUTH.
     --ensure-local TRUEOS only: start the installed xerj-service Blueprint
-                    when needed and wait for authenticated local readiness.
+                    before the MCP handshake; wait for authenticated readiness.
                     Requires http://127.0.0.1:9200 (localhost also accepted).
+    --lazy-local   TRUEOS only: discover tools without starting the local node.
+                    Start/authenticate it on the first node-backed tool call.
+                    Same endpoint requirement; exclusive with --ensure-local.
     -h, --help      Show this help
     -V, --version   Print version and exit
     --disable-feedback
@@ -341,6 +419,7 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
     let mut url_override: Option<String> = None;
     let mut auth_override: Option<String> = None;
     let mut ensure_local = false;
+    let mut lazy_local = false;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -373,6 +452,7 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
                 );
             }
             "--ensure-local" => ensure_local = true,
+            "--lazy-local" => lazy_local = true,
             other => {
                 // Fail loudly: a typo'd flag that is silently ignored leaves the
                 // agent talking to the wrong node with no way to notice.
@@ -381,6 +461,11 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
         }
     }
 
+    anyhow::ensure!(
+        !(ensure_local && lazy_local),
+        "--ensure-local and --lazy-local are mutually exclusive"
+    );
+
     let base_url = url_override
         .or_else(|| std::env::var("XERJ_URL").ok())
         .filter(|s| !s.is_empty())
@@ -388,18 +473,29 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
         .trim_end_matches('/')
         .to_string();
     let env_auth = std::env::var("XERJ_AUTH").ok();
-    let (auth, auth_key_file) = if ensure_local {
+    let (auth, auth_key_file) = if ensure_local || lazy_local {
         #[cfg(not(target_os = "trueos"))]
         anyhow::bail!(
-            "--ensure-local requires TRUEOS; start the node separately and omit this flag"
+            "{} requires TRUEOS; start the node separately and omit this flag",
+            if lazy_local {
+                "--lazy-local"
+            } else {
+                "--ensure-local"
+            }
         );
         #[cfg(target_os = "trueos")]
         {
+            local_service::validate_endpoint(&base_url)?;
             let explicit_auth = auth_override
                 .filter(|value| !value.is_empty())
                 .or_else(|| env_auth.filter(|value| !value.is_empty()));
-            let auth = local_service::ensure(&base_url, explicit_auth.as_deref()).await?;
-            (Some(auth), None)
+            if ensure_local {
+                let auth = local_service::ensure(&base_url, explicit_auth.as_deref()).await?;
+                (Some(auth), None)
+            } else {
+                // No key lookup, network probe or service launch at discovery.
+                (explicit_auth, None)
+            }
         }
     } else {
         resolve_auth(auth_override, env_auth, &base_url)
@@ -407,7 +503,7 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
     // Keep subsequent tool requests on the same literal loopback origin that
     // readiness authenticated, including when the caller supplied localhost.
     #[cfg(target_os = "trueos")]
-    let base_url = if ensure_local {
+    let base_url = if ensure_local || lazy_local {
         local_service::ENDPOINT.to_string()
     } else {
         base_url
@@ -451,6 +547,23 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
     let (stdin, stdout) = (tokio::io::stdin(), tokio::io::stdout());
     #[cfg(target_os = "trueos")]
     let (stdin, stdout) = (native_stdio::Stdin::new(), native_stdio::Stdout::new());
+    #[cfg(target_os = "trueos")]
+    if lazy_local {
+        let explicit_auth = ctx.auth.clone();
+        let local = LocalActivation::new(move || {
+            let explicit_auth = explicit_auth.clone();
+            async move { local_service::ensure(local_service::ENDPOINT, explicit_auth.as_deref()).await }
+        });
+        return serve_session(
+            Session {
+                ctx,
+                local: Some(local),
+            },
+            BufReader::new(stdin),
+            stdout,
+        )
+        .await;
+    }
     serve(ctx, BufReader::new(stdin), stdout).await
 }
 
@@ -471,7 +584,15 @@ where
     R: tokio::io::AsyncBufRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let ctx = std::sync::Arc::new(ctx);
+    serve_session(Session { ctx, local: None }, reader, stdout).await
+}
+
+async fn serve_session<R, W>(session: Session, reader: R, stdout: W) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let ctx = std::sync::Arc::new(session);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
     let writer = tokio::spawn(async move {
         let mut stdout = stdout;
@@ -513,7 +634,7 @@ where
             Value::Array(batch) => {
                 let mut out = Vec::new();
                 for m in batch {
-                    if let Some(r) = handle_message(&ctx, m).await {
+                    if let Some(r) = ctx.handle_message(m).await {
                         out.push(r);
                     }
                 }
@@ -532,7 +653,7 @@ where
                     Some(key) => {
                         let registry = in_flight.clone();
                         in_flight.start(&mut calls, key, move |token| async move {
-                            let reply = handle_message(&ctx, msg).await;
+                            let reply = ctx.handle_message(msg).await;
                             // A cancellation that got here first means: say nothing.
                             if registry.finish(token) {
                                 if let Some(reply) = reply {
@@ -548,7 +669,7 @@ where
                     // each other's reply.
                     None => {
                         calls.spawn(async move {
-                            if let Some(reply) = handle_message(&ctx, msg).await {
+                            if let Some(reply) = ctx.handle_message(msg).await {
                                 let _ = tx.send(reply);
                             }
                         });
@@ -556,7 +677,7 @@ where
                 }
                 Vec::new()
             }
-            other => handle_message(&ctx, other).await.into_iter().collect(),
+            other => ctx.handle_message(other).await.into_iter().collect(),
         };
 
         if responses.into_iter().any(|resp| tx.send(resp).is_err()) {
@@ -4107,6 +4228,17 @@ mod tests {
         tokio::io::DuplexStream,
         tokio::io::Lines<BufReader<tokio::io::DuplexStream>>,
     ) {
+        stdio_session_with_activation(base_url, timeout, None)
+    }
+
+    fn stdio_session_with_activation(
+        base_url: String,
+        timeout: Duration,
+        local: Option<LocalActivation>,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::io::Lines<BufReader<tokio::io::DuplexStream>>,
+    ) {
         let (client_in, server_in) = tokio::io::duplex(64 * 1024);
         let (server_out, client_out) = tokio::io::duplex(64 * 1024);
         let ctx = Ctx {
@@ -4114,7 +4246,11 @@ mod tests {
             base_url,
             auth: None,
         };
-        tokio::spawn(serve(ctx, BufReader::new(server_in), server_out));
+        tokio::spawn(serve_session(
+            Session { ctx, local },
+            BufReader::new(server_in),
+            server_out,
+        ));
         (client_in, BufReader::new(client_out).lines())
     }
 
@@ -4123,6 +4259,208 @@ mod tests {
             .write_all(format!("{msg}\n").as_bytes())
             .await
             .unwrap();
+    }
+
+    fn overview_call(id: u64) -> Value {
+        json!({"jsonrpc":"2.0", "id":id, "method":"tools/call",
+            "params":{"name":"xerj_brain_overview", "arguments":{"brain":"fixture"}}})
+    }
+
+    async fn next_reply(
+        stdout: &mut tokio::io::Lines<BufReader<tokio::io::DuplexStream>>,
+    ) -> Value {
+        let line = tokio::time::timeout(Duration::from_secs(5), stdout.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("MCP reply");
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn lazy_local_discovery_stays_idle_and_concurrent_calls_share_activation() {
+        use axum::{http::HeaderMap, routing::get, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let node = Router::new().route(
+            "/_graph/fixture/overview",
+            get(move |headers: HeaderMap| {
+                let observed = observed.clone();
+                async move {
+                    assert_eq!(headers.get("authorization").unwrap(), "ApiKey fixture");
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({"node":"ready"}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, node).await.unwrap();
+        });
+        let activations = Arc::new(AtomicUsize::new(0));
+        let started = activations.clone();
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let release = ready.clone();
+        let local = LocalActivation::new(move || {
+            let (started, release) = (started.clone(), release.clone());
+            async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                release.notified().await;
+                Ok("ApiKey fixture".into())
+            }
+        });
+        let (mut stdin, mut stdout) =
+            stdio_session_with_activation(endpoint, Duration::from_secs(2), Some(local));
+
+        for (id, method) in [(1, "initialize"), (2, "tools/list"), (3, "ping")] {
+            send_line(
+                &mut stdin,
+                json!({"jsonrpc":"2.0", "id":id, "method":method}),
+            )
+            .await;
+            let reply = next_reply(&mut stdout).await;
+            assert_eq!(reply["id"], id);
+            if method == "tools/list" {
+                assert!(reply["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == "xerj_search"));
+            }
+        }
+        send_line(
+            &mut stdin,
+            json!({"id":4,"method":"tools/call",
+            "params":{"name":"unknown_tool"}}),
+        )
+        .await;
+        assert_eq!(next_reply(&mut stdout).await["result"]["isError"], true);
+        assert_eq!(activations.load(Ordering::SeqCst), 0);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+        send_line(&mut stdin, overview_call(5)).await;
+        send_line(&mut stdin, overview_call(6)).await;
+        send_line(&mut stdin, json!({"id":7,"method":"ping"})).await;
+        assert_eq!(
+            next_reply(&mut stdout).await["id"],
+            7,
+            "readiness must not block protocol discovery/keepalive"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while activations.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        ready.notify_one();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let reply = next_reply(&mut stdout).await;
+            assert_ne!(reply["result"]["isError"], true, "{reply}");
+            assert!(reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("ready"));
+            ids.push(reply["id"].as_u64().unwrap());
+        }
+        ids.sort();
+        assert_eq!(ids, [5, 6]);
+        assert_eq!(activations.load(Ordering::SeqCst), 1);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        drop(stdin);
+        assert!(stdout.next_line().await.unwrap().is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn lazy_local_failed_and_cancelled_activation_can_be_retried() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = attempts.clone();
+        let local = LocalActivation::new(move || {
+            let count = count.clone();
+            async move {
+                match count.fetch_add(1, Ordering::SeqCst) {
+                    0 => anyhow::bail!("service unavailable"),
+                    1 => std::future::pending().await,
+                    _ => Ok("ApiKey fixture".into()),
+                }
+            }
+        });
+        let (mut stdin, mut stdout) = stdio_session_with_activation(
+            "http://127.0.0.1:1".into(),
+            Duration::from_secs(1),
+            Some(local),
+        );
+        send_line(&mut stdin, overview_call(1)).await;
+        let reply = next_reply(&mut stdout).await;
+        assert_eq!(reply["result"]["isError"], true);
+        assert!(reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("service unavailable"));
+        send_line(&mut stdin, overview_call(2)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while attempts.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        send_line(
+            &mut stdin,
+            json!({"method":"notifications/cancelled","params":{"requestId":2}}),
+        )
+        .await;
+        send_line(&mut stdin, overview_call(3)).await;
+        let reply = next_reply(&mut stdout).await;
+        assert_eq!(reply["id"], 3);
+        // The retry completed activation and reached the (deliberately closed)
+        // node. Cancellation did not cache an error or leave the gate locked.
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(!reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("activation failed"));
+        drop(stdin);
+        assert!(stdout.next_line().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn lazy_local_only_activates_for_served_node_tools() {
+        for name in [
+            "xerj_field_report",
+            "xerj_corpus_feedback",
+            "xerj_hub_find",
+            "unknown",
+        ] {
+            assert!(!is_node_tool_call(
+                &json!({"method":"tools/call","params":{"name":name}})
+            ));
+        }
+        for tool in tool_specs().as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            if !matches!(
+                name,
+                "xerj_field_report" | "xerj_corpus_feedback" | "xerj_hub_find"
+            ) {
+                assert!(
+                    is_node_tool_call(&json!({"method":"tools/call","params":{"name":name}})),
+                    "{name}"
+                );
+            }
+        }
+        assert!(!is_node_tool_call(&json!({"method":"tools/list"})));
     }
 
     fn stalled_search(id: u64) -> Value {
