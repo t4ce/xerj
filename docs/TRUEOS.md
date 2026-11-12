@@ -117,8 +117,9 @@ configuration by default; user configuration can override it:
 ```toml
 [mcp_servers.xerj]
 command = "xerj"
-args = ["mcp", "--ensure-local"]
+args = ["mcp", "--lazy-local"]
 startup_timeout_sec = 120
+tool_timeout_sec = 150
 required = false
 
 [mcp_servers.xerj.env]
@@ -129,8 +130,9 @@ XERJ_DISABLE_FEEDBACK = "true"
 Codex resolves the command through AppDB and starts a fresh instance with stdin,
 stdout, argv and environment. The `mcp` path dispatches before startup banners:
 stdout carries only newline-delimited JSON-RPC, while diagnostics use stderr.
-`--ensure-local` starts the installed `xerj-service` archive headlessly through
-the generic launch API, independently of the MCP proxy. The launcher holds an
+`--lazy-local` discovers tools without starting the engine. Its first tool call
+starts the installed `xerj-service` archive headlessly through the generic launch
+API, independently of the MCP proxy. The launcher holds an
 exclusive lock before spawning its engine, so simultaneous Codex sessions
 share one engine. Closing a proxy leaves the engine available for other
 clients; stopping the service Hull stops its child. Reopening an MCP session
@@ -143,7 +145,7 @@ never passes `--insecure`. The returned credential is also used for subsequent
 MCP tool requests. Diagnostics go to stderr and contain no credential.
 
 Default `xerj mcp` remains a proxy to an existing node on every platform. For
-a remote node or another local port omit `--ensure-local` and set `XERJ_URL`
+a remote node or another local port omit the native activation flags and set `XERJ_URL`
 and `XERJ_AUTH` normally. The opt-in flag rejects those endpoints before launch;
 outside TRUEOS it returns an unsupported-platform error.
 For the optional standalone package use `command = "xerj-mcp"` and remove
@@ -214,6 +216,34 @@ downloaded from Hugging Face or supplied locally through the embedding config.
 `--decide-mode local --decide-model-dir <path>` activates the compiled local
 decision backend. Model loading and neural results require separate native
 verification; a successful lexical search does not establish either.
+
+**Query-1 is a separate runtime.**
+
+The public-source TRUEOS package does not contain Query-1's facts compiler,
+executor or `xerj_facts_ask` tool. Upstream's [rc.101 provenance note](../CHANGELOG.md)
+states that its release binaries add private engine wiring and three proprietary
+crates (`xerj-infer`, `xerj-serve`, `xerj-exec`). Enabling the public `neural`
+and `decide-local` features does not add those components.
+
+The upstream `--with-model` installer downloads both a supported host executable
+and a separate model-data bundle. Its Linux executable is an ELF DYN program;
+TRUEOS Blueprint loading requires a native relocatable ELF REL payload. The
+model directory contains weights, tokenizers and metadata, without a native
+runtime. Native Query-1 needs an upstream TRUEOS-compatible runtime or access
+to the missing implementation for a native build.
+
+A separate Linux-host trial on 2026-11-12 checksum-verified rc.101 and its model
+bundle, restricted execution to four CPU cores, and observed `model.state=loaded`.
+Synthetic HTTP checks passed lookup, comparison, set counting with partner
+agreement, `UNKNOWN` and `CONFLICT`. MCP listed 24 tools including
+`xerj_facts_ask`, which returned the expected sourced answer. These results
+verify the downloaded host release, not native TRUEOS Query-1 support.
+
+Query-1 also needs typed facts with source references; ordinary source-file
+indexing and agent memory are separate. Codex must select the facts tool for
+relevant questions and consume `final_status` and `final_answer`, preserving
+refusals. Connecting MCP does not automatically route every prompt through
+Query-1. See [the model quickstart](MODEL_QUICKSTART.md).
 
 Native PDF and legacy XLS extraction use isolated child Hulls through an
 entry-thread broker. The parent admits one parser at a time, bounds its output
